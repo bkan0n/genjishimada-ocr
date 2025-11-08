@@ -1,0 +1,58 @@
+[project]
+name = "genjishimada-ocr"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi==0.104.1",
+    "numpy==1.24.3",
+    "opencv-python-headless==4.8.1.78",
+    "paddleocr==2.7.0.3",
+    "paddlepaddle==2.6.1",
+    "pillow==10.1.0",
+    "uvicorn[standard]==0.24.0",
+]
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+exclude = ["tests"]
+line-length = 120
+target-version = "py310"
+
+lint.select = [
+    'E',
+    'F',
+    'W',
+    'A',
+    'PL',
+    'I',
+    'SIM',
+    'RUF',
+    'ASYNC',
+    'C4',
+    'INP',
+    'ERA',
+    'SLF',
+    'PIE',
+    'PYI',
+    'ANN',
+    'N',
+    'D',
+]
+lint.ignore = [
+    'ANN002',
+    'ANN003',
+    'D203',
+    'D100',
+    'D101',
+    'D104',
+    'RUF012',
+    'TC002',
+    'D213',
+    'TC001',
+]
+[tool.ruff.lint.pydocstyle]
+convention = "google"
