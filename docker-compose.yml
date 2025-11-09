@@ -3,3 +3,9 @@ services:
     container_name: genjishimada-ocr
     build:
       context: .
+    networks:
+      - genji-network
+
+networks:
+  genji-network:
+    external: true
