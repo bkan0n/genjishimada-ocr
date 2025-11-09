@@ -1,0 +1,5 @@
+services:
+  genjishimada-ocr:
+    container_name: genjishimada-ocr
+    build:
+      context: .
