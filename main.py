@@ -145,7 +145,6 @@ def _v3_dirs_for_language_code(language_code: LanguageCode) -> tuple[str | None,
     return det_dir, rec_dir
 
 
-# ========================== Simple global registry ==========================
 SUPPORTED_LANGUAGES: tuple[LanguageCode, ...] = ("en", "ch", "korean", "japan")
 OCR_ENGINES: dict[LanguageCode, PaddleOCR] = {}
 
@@ -240,7 +239,6 @@ def log_model_dirs() -> None:
         logger.info(f"[models] {language_code}: det={det_dir} rec={rec_dir}")
 
 
-# ================================ ROIs (16:9) ==================================
 ROI_TOPLEFT = [0.010, 0.020, 0.360, 0.300]
 ROI_TOPLEFT_WIDE = [0.005, 0.010, 0.420, 0.340]
 ROI_BANNER_TIGHT = [0.220, 0.180, 0.780, 0.360]
@@ -249,7 +247,6 @@ ROI_BOTTOMLEFT = [0.050, 0.825, 0.330, 0.990]
 ROI_NAME_SPECIFIC = [0.050, 0.800, 0.400, 0.900]
 
 
-# ================================ utils I/O ====================================
 def normalize_base64_padding(b64_string: str) -> str:
     """Normalize a base64 string by fixing URL-safe characters and padding.
 
@@ -377,7 +374,6 @@ def mask_cyan_regions(image_bgr: np.ndarray) -> np.ndarray:
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 1)  # type: ignore
 
 
-# ================================ OCR wrappers =================================
 def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str, float]]:
     """Run OCR on an image and return recognized text lines with confidences.
 
@@ -399,7 +395,7 @@ def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str,
         return []
     bgr_image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR) if len(image.shape) == 2 else image
     try:
-        # cls=False ici, et le modèle cls mobile v2 n'est pas chargé
+        # cls=False here, and the mobile v2 cls model is not loaded
         ocr_result = engine.ocr(bgr_image, cls=False) or []
     except Exception as e:
         logger.warning(f"OCR({language_code}) failed: {e}")
@@ -434,7 +430,6 @@ def join_lines(lines: list[tuple[str, float]]) -> str:
     return " ".join([t for t, _ in lines]).strip()
 
 
-# ================================ Time parsing =================================
 def parse_loose_numeric_token(raw_token: str) -> float | None:
     """Convert loosely formatted OCR digit tokens into a float value.
 
@@ -516,7 +511,6 @@ def extract_banner_time_seconds(text: str) -> float | None:
     return best_scored_candidate[1] if best_scored_candidate else None
 
 
-# =============================== Name (script-aware) ===========================
 _HANGUL = r"\uAC00-\uD7A3\u1100-\u11FF\u3130-\u318F"
 _HIRAKATA = r"\u3040-\u30FF\u31F0-\u31FF\uFF66-\uFF9F"
 _HAN = r"\u3400-\u4DBF\u4E00-\u9FFF"
@@ -873,7 +867,6 @@ def extract_name(  # noqa: PLR0913
     return None
 
 
-# =============================== Code extraction =================================
 def normalize_map_code(raw_code_text: str | None) -> str | None:
     """Normalize and validate a candidate map code string.
 
@@ -958,7 +951,6 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
     return None
 
 
-# ================================ API ===========================================
 class ImageBase64Payload(BaseModel):
     """Pydantic model for a base64-encoded image payload.
 
