@@ -53,6 +53,7 @@ lint.ignore = [
     'TC002',
     'D213',
     'TC001',
+    'PLR2004'
 ]
 [tool.ruff.lint.pydocstyle]
 convention = "google"
