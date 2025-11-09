@@ -7,14 +7,14 @@ import os
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal, get_args
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from paddleocr import PaddleOCR
 from PIL import Image, ImageFile
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 # --- CPU safe flags (MKL/oneDNN off, thread caps) ---
 os.environ.setdefault("OPENBLAS_CORETYPE", "NEHALEM")
@@ -56,7 +56,56 @@ RE_MAP_CODE_NORMALIZATION = re.compile(r"MAP\s*[CLO0][O0D]{2}E", flags=re.IGNORE
 PADDLE_WHL_DIR = Path.home() / ".paddleocr" / "whl"
 
 
-def _v3_dirs_for_language_code(language_code: str) -> tuple[str | None, str | None]:
+LanguageCode = Literal["en", "ch", "korean", "japan"]
+RoiLabel = Literal["BL", "BAN"]  # extend later if you add more
+
+
+def to_camel(s: str) -> str:
+    """Convert a string to camel case."""
+    parts = s.split("_")
+    return parts[0] + "".join(p.title() for p in parts[1:])
+
+
+class CamelModel(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+
+class ScriptProfile(BaseModel):
+    hangul: float
+    kana: float
+    han: float
+    latin: float
+
+
+class OcrCandidate(BaseModel):
+    text: str
+    confidence: float
+    language_code: LanguageCode
+    roi_label: RoiLabel
+    profile: ScriptProfile
+
+
+class ExtractedTexts(CamelModel):
+    top_left: str
+    top_left_white: str
+    top_left_cyan: str
+    banner: str
+    top_right: str
+    bottom_left: str
+
+
+class ExtractedResult(CamelModel):
+    name: str | None
+    time: float | None
+    code: str | None
+    texts: ExtractedTexts
+
+
+class ApiResponse(CamelModel):
+    extracted: ExtractedResult
+
+
+def _v3_dirs_for_language_code(language_code: LanguageCode) -> tuple[str | None, str | None]:
     """Return PP-OCRv3 detector/recognizer directories for a given language.
 
     The function resolves pre-baked PP-OCRv3 paths inside ~/.paddleocr/whl for the
@@ -97,11 +146,11 @@ def _v3_dirs_for_language_code(language_code: str) -> tuple[str | None, str | No
 
 
 # ========================== Simple global registry ==========================
-SUPPORTED_LANGUAGES = ("en", "ch", "korean", "japan")
-OCR_ENGINES: dict[str, PaddleOCR] = {}
+SUPPORTED_LANGUAGES: tuple[LanguageCode, ...] = ("en", "ch", "korean", "japan")
+OCR_ENGINES: dict[LanguageCode, PaddleOCR] = {}
 
 
-def _build_ocr_engine(language_code: str) -> PaddleOCR:
+def _build_ocr_engine(language_code: LanguageCode) -> PaddleOCR:
     """Build and return a PaddleOCR engine configured for PP-OCRv3 (CPU).
 
     The engine is constructed with deterministic CPU settings, MKLDNN disabled, and
@@ -133,7 +182,7 @@ def _build_ocr_engine(language_code: str) -> PaddleOCR:
     )
 
 
-def warm_ocr_engines(languages: tuple[str, ...] = SUPPORTED_LANGUAGES) -> None:
+def warm_ocr_engines(languages: tuple[LanguageCode, ...] = SUPPORTED_LANGUAGES) -> None:
     """Initialize and cache PaddleOCR engines for the given languages.
 
     Iterates the provided language sequence and warms each engine once. Engines are
@@ -160,7 +209,7 @@ def warm_ocr_engines(languages: tuple[str, ...] = SUPPORTED_LANGUAGES) -> None:
             logger.exception(f"❌ Failed to warm {language_code}: {e}")
 
 
-def get_ocr_engine(language_code: str) -> PaddleOCR:
+def get_ocr_engine(language_code: LanguageCode) -> PaddleOCR:
     """Retrieve a previously initialized PaddleOCR engine from the registry.
 
     Args:
@@ -234,7 +283,6 @@ def decode_base64_image(image_b64: str) -> np.ndarray:
       HTTPException: With status 400 for missing input, invalid base64, or an
         unreadable image stream; with status 500 for unexpected decode errors.
     """
-    """Decode b64 image."""
     if not image_b64:
         raise HTTPException(status_code=400, detail="image_b64 is required")
     if image_b64.startswith("data:"):
@@ -286,9 +334,9 @@ def enhance_contrast_grayscale(image_bgr: np.ndarray) -> np.ndarray:
     Returns:
       A single-channel uint8 grayscale image after enhancement.
     """
-    g = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    g = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(g)
-    return cv2.GaussianBlur(g, (3, 3), 0)
+    grayscale = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    grayscale = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(grayscale)
+    return cv2.GaussianBlur(grayscale, (3, 3), 0)
 
 
 def mask_white_regions(image_bgr: np.ndarray) -> np.ndarray:
@@ -305,9 +353,9 @@ def mask_white_regions(image_bgr: np.ndarray) -> np.ndarray:
       A binary (uint8) mask highlighting white regions.
     """
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    m = cv2.inRange(hsv, np.array([0, 0, 190], np.uint8), np.array([179, 60, 255], np.uint8))
-    m = cv2.medianBlur(m, 3)
-    return cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 1)  # type: ignore
+    mask = cv2.inRange(hsv, np.array([0, 0, 190], np.uint8), np.array([179, 60, 255], np.uint8))
+    mask = cv2.medianBlur(mask, 3)
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 1)  # type: ignore
 
 
 def mask_cyan_regions(image_bgr: np.ndarray) -> np.ndarray:
@@ -324,13 +372,13 @@ def mask_cyan_regions(image_bgr: np.ndarray) -> np.ndarray:
       A binary (uint8) mask highlighting cyan regions.
     """
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    m = cv2.inRange(hsv, np.array([80, 50, 120], np.uint8), np.array([105, 255, 255], np.uint8))
-    m = cv2.medianBlur(m, 3)
-    return cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 1)  # type: ignore
+    mask = cv2.inRange(hsv, np.array([80, 50, 120], np.uint8), np.array([105, 255, 255], np.uint8))
+    mask = cv2.medianBlur(mask, 3)
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 1)  # type: ignore
 
 
 # ================================ OCR wrappers =================================
-def ocr_lines(image: np.ndarray, language_code: str) -> list[tuple[str, float]]:
+def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str, float]]:
     """Run OCR on an image and return recognized text lines with confidences.
 
     Wraps the PaddleOCR `ocr()` method for a specific language model. Handles both
@@ -442,28 +490,30 @@ def extract_banner_time_seconds(text: str) -> float | None:
         .replace("SE€", "SEC")
         .replace("SEL", "SEC")
     )
-    text = re.sub(r"\s+", " ", text).strip()
-    i = text.find("TIME")
-    if i != -1:
-        win = text[i : i + 80]
-        m = re.search(RE_PARSE_BANNER_TIME_SEARCH_WITH_SEC, win)
-        if m:
-            v = parse_loose_numeric_token(m.group(1))
-            if v is not None:
-                return v
-    best = None
-    for m in re.finditer(RE_PARSE_BANNER_TIME_SEARCH_NO_SEC, text):
-        cand = parse_loose_numeric_token(m.group(1))
-        if cand is None:
+    text = re.sub(RE_SPACES, " ", text).strip()
+    time_keyword_index = text.find("TIME")
+    if time_keyword_index != -1:
+        search_window = text[time_keyword_index : time_keyword_index + 80]
+        with_sec_match = re.search(RE_PARSE_BANNER_TIME_SEARCH_WITH_SEC, search_window)
+        if with_sec_match:
+            value = parse_loose_numeric_token(with_sec_match.group(1))
+            if value is not None:
+                return value
+    best_scored_candidate = None
+    for numeric_match in re.finditer(RE_PARSE_BANNER_TIME_SEARCH_NO_SEC, text):
+        candidate = parse_loose_numeric_token(numeric_match.group(1))
+        if candidate is None:
             continue
-        j, score = m.start(), 0
-        if i != -1 and 0 <= (j - i) <= 80:
+
+        score = 0
+        distance = numeric_match.start()
+        if time_keyword_index != -1 and 0 <= (distance - time_keyword_index) <= 80:
             score += 2
-        if re.search(RE_PARSE_BANNER_TIME_SEARCH_ONLY_SEC, text[m.end() : m.end() + 8]):
+        if re.search(RE_PARSE_BANNER_TIME_SEARCH_ONLY_SEC, text[numeric_match.end() : numeric_match.end() + 8]):
             score += 1
-        if best is None or score > best[0]:
-            best = (score, cand)
-    return best[1] if best else None
+        if best_scored_candidate is None or score > best_scored_candidate[0]:
+            best_scored_candidate = (score, candidate)
+    return best_scored_candidate[1] if best_scored_candidate else None
 
 
 # =============================== Name (script-aware) ===========================
@@ -537,7 +587,7 @@ def fraction_of_unicode_class(unicode_class_pattern: str, text: str) -> float:
     return 0.0 if not compact else len(re.findall(f"[{unicode_class_pattern}]", compact)) / len(compact)
 
 
-def build_script_profile(text: str) -> dict[str, float]:
+def build_script_profile(text: str) -> ScriptProfile:
     """Generate a script composition profile for a string.
 
     Calculates the relative fraction of Hangul, Kana, Han, and Latin characters in
@@ -550,12 +600,12 @@ def build_script_profile(text: str) -> dict[str, float]:
       Dictionary mapping script names ('hangul', 'kana', 'han', 'latin') to their
       respective fractions (0.0-1.0).
     """
-    return {
-        "hangul": fraction_of_unicode_class(_HANGUL, text),
-        "kana": fraction_of_unicode_class(_HIRAKATA, text),
-        "han": fraction_of_unicode_class(_HAN, text),
-        "latin": fraction_of_unicode_class(_LATIN, text),
-    }
+    return ScriptProfile(
+        hangul=fraction_of_unicode_class(_HANGUL, text),
+        kana=fraction_of_unicode_class(_HIRAKATA, text),
+        han=fraction_of_unicode_class(_HAN, text),
+        latin=fraction_of_unicode_class(_LATIN, text),
+    )
 
 
 def roi_label_weight(roi_label: str) -> float:
@@ -606,7 +656,7 @@ def normalize_banner_fragment(fragment_text: str) -> str:
     return re.sub(RE_CLEAN_BANNER_FRAGMENT, " ", fragment_text).strip(" :|~!.,*_-").strip()
 
 
-def ocr_with_labels(image: np.ndarray, language_code: str, roi_label: str) -> list[dict]:
+def ocr_with_labels(image: np.ndarray, language_code: LanguageCode, roi_label: RoiLabel) -> list[OcrCandidate]:
     """Run OCR on an image for a given language and attach metadata labels.
 
     Executes text recognition using the specified language engine, computes script
@@ -621,22 +671,21 @@ def ocr_with_labels(image: np.ndarray, language_code: str, roi_label: str) -> li
       A list of dictionaries containing text, confidence, language, ROI, and script
       profile metrics.
     """
-    out = []
+    out: list[OcrCandidate] = []
     for text, confidence in ocr_lines(image, language_code):
-        profile = build_script_profile(text)
         out.append(
-            {
-                "text": text.strip(),
-                "conf": float(confidence or 0.0),
-                "lang": language_code,
-                "roi": roi_label,
-                "prof": profile,
-            }
+            OcrCandidate(
+                text=text.strip(),
+                confidence=float(confidence or 0.0),
+                language_code=language_code,
+                roi_label=roi_label,
+                profile=build_script_profile(text),
+            )
         )
     return out
 
 
-def select_best_name_candidate(candidates: list[dict]) -> str | None:
+def select_best_name_candidate(candidates: list[OcrCandidate]) -> str | None:
     """Select the best candidate name among multiple OCR detections.
 
     Scores each candidate using a mix of OCR confidence, script consistency,
@@ -652,40 +701,36 @@ def select_best_name_candidate(candidates: list[dict]) -> str | None:
     if not candidates:
         return None
 
-    # If there is a lot of Hangul, keep only strong Korean blocks
-    if any(c["prof"]["hangul"] >= 0.40 for c in candidates):
-        candidates = [c for c in candidates if c["prof"]["hangul"] >= 0.20 or c["lang"] == "korean"]
+    if any(c.profile.hangul >= 0.40 for c in candidates):
+        candidates = [c for c in candidates if c.profile.hangul >= 0.20 or c.language_code == "korean"]
 
-    def score(_candidate) -> float:
-        conf, prof, roi, lang = _candidate["conf"], _candidate["prof"], _candidate["roi"], _candidate["lang"]
-        exp = expected_script_for_language(lang)
+    def score(c: OcrCandidate) -> float:
+        exp = expected_script_for_language(c.language_code)
         bonus = 0.0
-        if exp == "hangul" and prof["hangul"] >= 0.50:
+        if exp == "hangul" and c.profile.hangul >= 0.50:
             bonus += 0.35
-        if exp == "kana" and (prof["kana"] >= 0.40 or (prof["han"] >= 0.25 and prof["kana"] >= 0.20)):
+        if exp == "kana" and (c.profile.kana >= 0.40 or (c.profile.han >= 0.25 and c.profile.kana >= 0.20)):
             bonus += 0.30
-        if exp == "han" and prof["han"] >= 0.60:
+        if exp == "han" and c.profile.han >= 0.60:
             bonus += 0.25
-        bonus += 0.30 * prof["hangul"] + 0.20 * prof["kana"] + 0.10 * prof["han"]
-        bonus += roi_label_weight(roi)
-        return conf + bonus
+        bonus += 0.30 * c.profile.hangul + 0.20 * c.profile.kana + 0.10 * c.profile.han
+        bonus += roi_label_weight(c.roi_label)
+        return c.confidence + bonus
 
-    pool = []
+    pool: list[OcrCandidate] = []
     for c in candidates:
-        normalized_text = normalize_banner_fragment(c["text"])
+        normalized_text = normalize_banner_fragment(c.text)
         if not normalized_text:
             continue
-        if max(c["prof"]["hangul"], c["prof"]["kana"], c["prof"]["han"]) < 0.20:
+        if max(c.profile.hangul, c.profile.kana, c.profile.han) < 0.20:
             continue
         if len(remove_all_whitespace(normalized_text)) < 2:
             continue
-        c2 = dict(c)
-        c2["text"] = normalized_text
-        pool.append(c2)
+        pool.append(c.model_copy(update={"text": normalized_text}))
 
     if not pool:
         return None
-    return max(pool, key=score)["text"]
+    return max(pool, key=score).text
 
 
 # -------- ASCII helpers --------
@@ -701,12 +746,12 @@ def ascii_name_from_bottom_left(text: str) -> str | None:
     Returns:
       Extracted ASCII name string, or None if no valid name is found.
     """
-    s = (text or "").upper().strip()
-    if not s:
+    normalized = (text or "").upper().strip()
+    if not normalized:
         return None
 
     # Split into words and only keep the last one
-    tokens = re.split(RE_SPACES, s)
+    tokens = re.split(RE_SPACES, normalized)
     last = tokens[-1]
 
     # Name must be at least 3 chars, start with a letter,
@@ -732,19 +777,19 @@ def ascii_name_from_banner_or_top_right(text_banner_en: str, text_top_right_en: 
     Returns:
       Extracted ASCII name if found, otherwise None.
     """
-    s_ban = (text_banner_en or "").upper()
+    banner_text_upper = (text_banner_en or "").upper()
 
     # Pattern "XYZ MISSION COMPLETE"
-    m = re.search(RE_XYZ_MISSION_COMPLETE, s_ban)
-    if m:
-        candidate = m.group(1)
+    mission_match = re.search(RE_XYZ_MISSION_COMPLETE, banner_text_upper)
+    if mission_match:
+        candidate = mission_match.group(1)
         if candidate not in _GENERIC_ASCII:
             return candidate
 
-    s_tr = (text_top_right_en or "").upper()
-    m = re.search(RE_GET_USER_NAME_FROM_TOP_5, s_tr)
-    if m:
-        candidate = m.group(1)
+    top_right_text_upper = (text_top_right_en or "").upper()
+    top5_match = re.search(RE_GET_USER_NAME_FROM_TOP_5, top_right_text_upper)
+    if top5_match:
+        candidate = top5_match.group(1)
         if candidate not in _GENERIC_ASCII:
             return candidate
 
@@ -792,16 +837,18 @@ def extract_name(  # noqa: PLR0913
     ascii_bottom_left = ascii_name_from_bottom_left(text_bottom_left_en)
 
     # 2. CJK candidates (BL + banner)
-    candidates: list[dict] = []
-    for lang in ["korean", "japan", "ch"]:
-        candidates += ocr_with_labels(image_bottom_left, lang, "BL")
-        candidates += ocr_with_labels(image_bottom_left_alt, lang, "BL")
-        candidates += ocr_with_labels(image_banner, lang, "BAN")
-        candidates += ocr_with_labels(image_banner_white, lang, "BAN")
-        candidates += ocr_with_labels(image_banner_binary, lang, "BAN")
+    candidates: list[OcrCandidate] = []
+    for language_code in get_args(LanguageCode):
+        if language_code == "en":
+            continue
+        candidates += ocr_with_labels(image_bottom_left, language_code, "BL")
+        candidates += ocr_with_labels(image_bottom_left_alt, language_code, "BL")
+        candidates += ocr_with_labels(image_banner, language_code, "BAN")
+        candidates += ocr_with_labels(image_banner_white, language_code, "BAN")
+        candidates += ocr_with_labels(image_banner_binary, language_code, "BAN")
 
     # 2.a. CJK candidate specifically in bottom-left HUD
-    candidates_bottom_left = [c for c in candidates if c["roi"] == "BL"]
+    candidates_bottom_left = [c for c in candidates if c.roi_label == "BL"]
     name_cjk_bottom_left = select_best_name_candidate(candidates_bottom_left)
 
     # IMPORTANT:
@@ -879,24 +926,24 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
     )
 
     # 1) strict pattern: "MAP CODE: XXXX"
-    m = re.search(RE_MAP_CODE_FULL, normalized)
-    if m:
-        candidate = normalize_map_code(m.group(1))
+    strict_pattern_match = re.search(RE_MAP_CODE_FULL, normalized)
+    if strict_pattern_match:
+        candidate = normalize_map_code(strict_pattern_match.group(1))
         if candidate:
             return candidate
 
     # 2) if there is "MAP", search in a short window after it
-    i = normalized.find("MAP")
-    if i != -1:
-        win = normalized[i : i + 80]
-        m2 = re.search(RE_MAP_CODE_SHORT, win)
-        if m2:
-            candidate = normalize_map_code(m2.group(1))
+    map_keyword_index = normalized.find("MAP")
+    if map_keyword_index != -1:
+        search_window = normalized[map_keyword_index : map_keyword_index + 80]
+        short_pattern_match = re.search(RE_MAP_CODE_SHORT, search_window)
+        if short_pattern_match:
+            candidate = normalize_map_code(short_pattern_match.group(1))
             if candidate:
                 return candidate
-        t = re.search(RE_MAP_CODE_CAPTURE, win)
-        if t:
-            candidate = normalize_map_code(t.group(1))
+        loose_pattern_match = re.search(RE_MAP_CODE_CAPTURE, search_window)
+        if loose_pattern_match:
+            candidate = normalize_map_code(loose_pattern_match.group(1))
             if candidate:
                 return candidate
 
@@ -956,8 +1003,8 @@ def ping() -> dict:
     return {"ok": True, "models": sorted(OCR_ENGINES.keys())}
 
 
-@app.post("/extract")
-def extract_ocr_data(payload: ImageBase64Payload) -> dict:
+@app.post("/extract", response_model=ApiResponse)
+def extract_ocr_data(payload: ImageBase64Payload) -> ApiResponse:
     """Extract structured data (name, time, code) from a base64 image.
 
     Performs decoding, ROI crops, masking/thresholding, OCR across multiple
@@ -1034,21 +1081,21 @@ def extract_ocr_data(payload: ImageBase64Payload) -> dict:
         text_top_right_en=text_top_right_en,
     )
 
-    return {
-        "extracted": {
-            "name": name,
-            "time": seconds,
-            "code": code,
-            "texts": {
-                "topLeft": text_top_left_en,
-                "topLeftWhite": text_top_left_white_en,
-                "topLeftCyan": text_top_left_cyan_en,
-                "banner": text_banner_en,
-                "topRight": text_top_right_en,
-                "bottomLeft": text_bottom_left_en,
-            },
-        }
-    }
+    return ApiResponse(
+        extracted=ExtractedResult(
+            name=name,
+            time=seconds,
+            code=code,
+            texts=ExtractedTexts(
+                top_left=text_top_left_en,
+                top_left_white=text_top_left_white_en,
+                top_left_cyan=text_top_left_cyan_en,
+                banner=text_banner_en,
+                top_right=text_top_right_en,
+                bottom_left=text_bottom_left_en,
+            ),
+        )
+    )
 
 
 if __name__ == "__main__":
