@@ -1,6 +1,6 @@
 services:
-  genjishimada-ocr:
-    container_name: genjishimada-ocr
+  genjishimada-ocr-dev:
+    container_name: genjishimada-ocr-dev
     build:
       context: .
     networks:
