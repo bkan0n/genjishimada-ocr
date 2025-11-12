@@ -1,0 +1,12 @@
+services:
+  genjishimada-ocr:
+    container_name: genjishimada-ocr
+    build:
+      context: .
+    networks:
+      - genji-network
+    restart: unless-stopped
+
+networks:
+  genji-network:
+    external: true

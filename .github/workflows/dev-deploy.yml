@@ -1,0 +1,74 @@
+name: Dev Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (branch, tag, or SHA) to deploy (defaults to main)"
+        required: false
+        default: "main"
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  deployments: write
+  contents: write
+  checks: read
+  statuses: read
+
+jobs:
+  dev-deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'issue_comment' && github.event.issue.pull_request) }}
+    runs-on: ubuntu-latest
+    environment: development
+
+    steps:
+      - name: branch-deploy
+        id: branch-deploy
+        if: ${{ github.event_name == 'issue_comment' }}
+        uses: github/branch-deploy@v11.0.0
+        with:
+          trigger: ".deploy"
+          reaction: "eyes"
+          environment: "development"
+          stable_branch: "main"
+          environment_targets: "development"
+          allow_forks: "true"
+          admins: "tylovejoy"
+
+      # Checkout for PR comment flow (uses branch-deploy's resolved SHA)
+      - name: Checkout repository (PR comment)
+        if: ${{ github.event_name == 'issue_comment' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.branch-deploy.outputs.sha }}
+
+      # Checkout for manual dispatch flow (uses input ref; defaults to main)
+      - name: Checkout repository (manual dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_HOST_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Add remote host to known_hosts
+        run: |
+          ssh-keyscan -H ${{ secrets.SERVER_HOST_IP }} >> ~/.ssh/known_hosts
+
+      - name: Set up Docker context for dev
+        run: |
+          docker context create dev-server \
+            --docker "host=ssh://${{ secrets.SERVER_HOST_USER }}@${{ secrets.SERVER_HOST_IP }}" \
+            --description "Dev server context"
+          docker context use dev-server
+
+      - name: Deploy to Remote Dev Server
+        run: |
+          echo "Deploying to Dev Server..."
+          docker compose -f docker-compose.dev.yml up -d --build --no-deps --force-recreate
