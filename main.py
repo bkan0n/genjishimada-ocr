@@ -880,7 +880,7 @@ def normalize_map_code(raw_code_text: str | None) -> str | None:
     Returns:
       Cleaned map code if valid, otherwise None.
     """
-    if not raw_code_text:
+    if not raw_code_text or raw_code_text in {"CODE", "C0DE"}:
         return None
     # Basic normalization
     raw_code_text = re.sub(RE_BASIC_NORMALIZATION, "", raw_code_text.upper().replace("O", "0"))
