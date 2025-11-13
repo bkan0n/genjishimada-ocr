@@ -895,51 +895,7 @@ def normalize_map_code(raw_code_text: str | None) -> str | None:
     return raw_code_text
 
 
-def extract_code(tl_text: str, tl_white_text: str, tl_cyan_text: str) -> str | None:
-    all_text = " ".join([tl_text or "", tl_white_text or "", tl_cyan_text or ""]).upper()
-
-    # Normalisation autour de "MAP CODE"
-    norm = all_text.replace("MAPCODE", "MAP CODE").replace("MAPC0DE", "MAP CODE")
-    norm = re.sub(r"MAP\s+C0DE", "MAP CODE", norm)
-    norm = re.sub(r"MAP\s+COOE", "MAP CODE", norm)
-    norm = re.sub(r"MAP\s+LODE", "MAP CODE", norm)
-    norm = re.sub(r"MAP\s+L0DE", "MAP CODE", norm)
-
-    # 1) motif strict : "MAP CODE: XXXX"
-    m = re.search(r"MAP\s*(?:C(?:O|0)?DE)\s*[:\-]?\s*([A-Z0-9]{4,6})\b", norm)
-    if m:
-        cand = normalize_map_code(m.group(1))
-        if cand:
-            return cand
-
-    # 2) s'il y a "MAP", chercher dans une fenêtre courte après
-    i = norm.find("MAP")
-    if i != -1:
-        win = norm[i : i + 80]
-        m2 = re.search(r"(?:C(?:O|0)?DE)\s*[:\-]?\s*([A-Z0-9]{4,6})\b", win)
-        if m2:
-            cand = normalize_map_code(m2.group(1))
-            if cand:
-                return cand
-
-        t = re.search(r"\b([A-Z0-9]{4,6})\b", win)
-        if t:
-            cand = normalize_map_code(t.group(1))
-            if cand:
-                return cand
-
-    # 3) dernier recours : scanner tous les tokens 4–6 chars
-    for token in re.findall(r"\b[A-Z0-9]{4,6}\b", norm):
-        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST"}:
-            continue
-        cand = normalize_map_code(token)
-        if cand:
-            return cand
-
-    return None
-
-
-def __extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_text: str) -> str | None:
+def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_text: str) -> str | None:
     """Extract a valid map code from OCR text using multiple heuristics.
 
     Merges text from multiple ROIs, normalizes "MAP CODE" variants, and searches
@@ -987,7 +943,7 @@ def __extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_t
 
     # 3) last resort: scan all 4-6 char tokens
     for token in re.findall(RE_MAP_CODE_FIND, normalized):
-        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST"}:
+        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE"}:
             continue
         candidate = normalize_map_code(token)
         if candidate:
