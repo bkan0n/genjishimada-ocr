@@ -935,28 +935,31 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
     # 1) strict pattern: "MAP CODE: XXXX"
     strict_pattern_match = re.search(RE_MAP_CODE_FULL, normalized)
     if strict_pattern_match:
-        candidate = normalize_map_code(strict_pattern_match.group(1))
-        if candidate:
-            return candidate
+        raw = strict_pattern_match.group(1) or ""
+        cleaned = re.sub(RE_BASIC_NORMALIZATION, "", raw.upper().replace("O", "0"))
+        if 4 <= len(cleaned) <= 6 and cleaned not in {"CODE", "C0DE"}:
+            return cleaned
 
     # 2) if there is "MAP", search in a short window after it
     map_keyword_index = normalized.find("MAP")
     if map_keyword_index != -1:
         search_window = normalized[map_keyword_index : map_keyword_index + 80]
+
         short_pattern_match = re.search(RE_MAP_CODE_SHORT, search_window)
         if short_pattern_match:
             candidate = normalize_map_code(short_pattern_match.group(1))
             if candidate:
                 return candidate
+
         loose_pattern_match = re.search(RE_MAP_CODE_CAPTURE, search_window)
         if loose_pattern_match:
             candidate = normalize_map_code(loose_pattern_match.group(1))
             if candidate:
                 return candidate
 
-    # 3) last resort: scan all 4-6 char tokens
+    # 3) last resort: scan all 4-6 char tokens (bruit max)
     for token in re.findall(RE_MAP_CODE_FIND, normalized):
-        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE", "BH0P", "BHOP"}:
+        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE"}:
             continue
         candidate = normalize_map_code(token)
         if candidate:
