@@ -880,7 +880,20 @@ def normalize_map_code(raw_code_text: str | None) -> str | None:
     Returns:
       Cleaned map code if valid, otherwise None.
     """
-    if not raw_code_text or raw_code_text in {"CODE", "C0DE"}:
+    if not raw_code_text or raw_code_text in {
+        "MADE",
+        "BY",
+        "TIME",
+        "SEC",
+        "SPLIT",
+        "LEVEL",
+        "TOP",
+        "PLAYTEST",
+        "CODE",
+        "C0DE",
+        "BH0P",
+        "BHOP",
+    }:
         return None
     # Basic normalization
     raw_code_text = re.sub(RE_BASIC_NORMALIZATION, "", raw_code_text.upper().replace("O", "0"))
@@ -943,7 +956,7 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
 
     # 3) last resort: scan all 4-6 char tokens
     for token in re.findall(RE_MAP_CODE_FIND, normalized):
-        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE"}:
+        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE", "BH0P", "BHOP"}:
             continue
         candidate = normalize_map_code(token)
         if candidate:
