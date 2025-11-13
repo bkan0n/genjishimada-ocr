@@ -6,11 +6,12 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import aiohttp
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from PIL import Image, ImageFile
-from pydantic import BaseModel  # <-- import placé AVANT usage
+from pydantic import BaseModel, HttpUrl  # <-- import placé AVANT usage
 
 # --- CPU safe flags (désactiver MKL-DNN / oneDNN & limiter threads) ---
 os.environ.setdefault("OPENBLAS_CORETYPE", "NEHALEM")
@@ -111,6 +112,7 @@ LAZY = LazyPaddleOCR()
 
 @app.on_event("startup")
 async def _warm_en():
+    app.state.http_session = aiohttp.ClientSession()
     LAZY._load_one("en")
 
 
@@ -541,7 +543,7 @@ def extract_code(tl_text: str, tl_white_text: str, tl_cyan_text: str) -> Optiona
 
 # ================================ API ===========================================
 class B64(BaseModel):
-    image_b64: str
+    image_url: HttpUrl
 
 
 @app.get("/ping")
@@ -550,11 +552,17 @@ def ping():
 
 
 @app.post("/extract")
-def extract(payload: B64):
+async def extract(payload: B64, request: Request):
     if LAZY.get("en") is None:
         raise HTTPException(status_code=503, detail="OCR models not ready yet")
     try:
-        img = decode_b64(payload.image_b64)
+        session = request.app.state.http_session
+        resp = await session.get(str(payload.image_url))
+        if resp.status != 200:
+            raise HTTPException(status_code=400, detail=f"failed to fetch image: HTTP {resp.status}")
+        image_bytes = await resp.read()
+        image_b64 = base64.b64encode(image_bytes).decode()
+        img = decode_b64(image_b64)
     except HTTPException as e:
         raise e
     except Exception as e:
