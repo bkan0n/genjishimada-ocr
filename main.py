@@ -9,12 +9,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Literal, get_args
 
+import aiohttp
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from paddleocr import PaddleOCR
 from PIL import Image, ImageFile
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, HttpUrl
 
 # --- CPU safe flags (MKL/oneDNN off, thread caps) ---
 os.environ.setdefault("OPENBLAS_CORETYPE", "NEHALEM")
@@ -961,6 +962,16 @@ class ImageBase64Payload(BaseModel):
     image_b64: str
 
 
+class ImageURLPayload(BaseModel):
+    """Pydantic model for an image URL payload.
+
+    Attributes:
+      image_url: HTTP(S) URL pointing to the image resource.
+    """
+
+    image_url: HttpUrl
+
+
 @asynccontextmanager
 async def warm_models_on_startup(app: FastAPI) -> AsyncIterator:
     """FastAPI startup hook that warms all configured OCR engines.
@@ -977,7 +988,9 @@ async def warm_models_on_startup(app: FastAPI) -> AsyncIterator:
     """
     log_model_dirs()
     warm_ocr_engines()
+    app.state.http_session = aiohttp.ClientSession()
     yield
+    await app.state.http_session.close()
 
 
 app = FastAPI(title="GenjiPK OCR", lifespan=warm_models_on_startup)
@@ -996,7 +1009,7 @@ def ping() -> dict:
 
 
 @app.post("/extract", response_model=ApiResponse)
-def extract_ocr_data(payload: ImageBase64Payload) -> ApiResponse:
+async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiResponse:
     """Extract structured data (name, time, code) from a base64 image.
 
     Performs decoding, ROI crops, masking/thresholding, OCR across multiple
@@ -1022,11 +1035,17 @@ def extract_ocr_data(payload: ImageBase64Payload) -> ApiResponse:
     if "en" not in OCR_ENGINES:
         raise HTTPException(status_code=503, detail="OCR models not ready yet")
     try:
-        img = decode_base64_image(payload.image_b64)
-    except HTTPException as e:
-        raise e
+        session = request.app.state.http_session
+        resp = await session.get(str(payload.image_url))
+        if resp.status != 200:
+            raise HTTPException(status_code=400, detail=f"failed to fetch image: HTTP {resp.status}")
+        image_bytes = await resp.read()
+        image_b64 = base64.b64encode(image_bytes).decode()
+        img = decode_base64_image(image_b64)
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=400, detail=f"error fetching image: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"unexpected decode error: {e}")
+        raise HTTPException(status_code=500, detail=f"unexpected error: {e}")
 
     top_left = crop_by_frac_roi(img, ROI_TOPLEFT)
     top_left_wide = crop_by_frac_roi(img, ROI_TOPLEFT_WIDE)
