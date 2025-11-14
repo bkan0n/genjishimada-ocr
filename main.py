@@ -490,6 +490,11 @@ def extract_banner_time_seconds(text: str) -> float | None:
     time_keyword_index = text.find("TIME")
     if time_keyword_index != -1:
         search_window = text[time_keyword_index : time_keyword_index + 80]
+        search_window = re.sub(
+            r"([0-9OQDBZGISL]{1,5})\s+([0-9OQDBZGISL]{1}\.\d{2})",
+            r"\1\2",
+            search_window,
+        )
         with_sec_match = re.search(RE_PARSE_BANNER_TIME_SEARCH_WITH_SEC, search_window)
         if with_sec_match:
             value = parse_loose_numeric_token(with_sec_match.group(1))
@@ -857,13 +862,13 @@ def extract_name(  # noqa: PLR0913
         return ascii_bottom_left
 
     # 3. Global fallback (banner / TOP5 / etc.)
-    name_cjk_all = select_best_name_candidate(candidates)
-    if name_cjk_all and count_cjk_characters(name_cjk_all) >= 2:
-        return name_cjk_all
-
     ascii_other = ascii_name_from_banner_or_top_right(text_banner_en, text_top_right_en)
     if ascii_other:
         return ascii_other
+
+    name_cjk_all = select_best_name_candidate(candidates)
+    if name_cjk_all and count_cjk_characters(name_cjk_all) >= 2:
+        return name_cjk_all
 
     return None
 
@@ -1092,6 +1097,13 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
         if _m:
             try:
                 seconds = float(_m.group(1).replace(",", "."))
+            except Exception:
+                seconds = None
+    if seconds is None:
+        _m2 = re.search(RE_PARSE_TIME_AGAIN, (text_top_left_white_en or "").upper())
+        if _m2:
+            try:
+                seconds = float(_m2.group(1).replace(",", "."))
             except Exception:
                 seconds = None
 
