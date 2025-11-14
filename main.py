@@ -1031,14 +1031,14 @@ def ping() -> dict:
 
 @app.post("/extract", response_model=ApiResponse)
 async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiResponse:
-    """Extract structured data (name, time, code) from a base64 image.
+    """Extract structured data (name, time, code) from an image URL.
 
     Performs decoding, ROI crops, masking/thresholding, OCR across multiple
     languages, robust parsing of banner time, and multi-heuristic extraction of
     player name and map code.
 
     Args:
-      payload: Pydantic model containing a base64-encoded image string.
+      payload: Pydantic model containing an image URL.
 
     Returns:
       A JSON-serializable dict with the extracted fields:
