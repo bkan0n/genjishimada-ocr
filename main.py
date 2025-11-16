@@ -46,6 +46,7 @@ RE_ASCII_NAME_MATCH = re.compile(r"[A-Z][A-Z0-9_]{2,23}")
 RE_XYZ_MISSION_COMPLETE = re.compile(r"([A-Z][A-Z0-9_]{2,24})\s+MISSION\s+COMPLETE")
 RE_GET_USER_NAME_FROM_TOP_5 = re.compile(r"\b([A-Z][A-Z0-9_]{2,24})\b.*?(\d{1,4}[.,]\d{2})\s*SEC")
 
+RE_TOP5_TIME_FOR_NAME = re.compile(r"\b([A-Z][A-Z0-9_]{2,24})\b\s+(\d{1,4}[.,]\d{2})\s*SEC")
 RE_MAP_CODE_FULL = re.compile(r"MAP\s*(?:C(?:O|0)?DE)\s*[:\-]?\s*([A-Z0-9]{4,6})\b")
 RE_MAP_CODE_SHORT = re.compile(r"(?:C(?:O|0)?DE)\s*[:\-]?\s*([A-Z0-9]{4,6})\b")
 RE_MAP_CODE_CAPTURE = re.compile(r"\b([A-Z0-9]{4,6})\b")
@@ -1029,6 +1030,38 @@ def ping() -> dict:
     return {"ok": True, "models": sorted(OCR_ENGINES.keys())}
 
 
+# ---------- HELPER FALLBACK TIME TOP5 ----------
+def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) -> float | None:
+    """Extract the correct time from TOP5 for the given player name.
+
+    - If `name` is known, use the time *shown under that username*.
+    - Otherwise, fall back to the first match (previous behavior).
+    """
+    if not text_top_right_en:
+        return None
+
+    upper = text_top_right_en.upper()
+    matches = list(re.finditer(RE_TOP5_TIME_FOR_NAME, upper))
+    if not matches:
+        return None
+
+    # If name, search matching entry
+    if name:
+        target = name.upper()
+        for m in matches:
+            if m.group(1) == target:
+                try:
+                    return float(m.group(2).replace(",", "."))
+                except Exception:
+                    return None
+
+    # Fallback
+    try:
+        return float(matches[0].group(2).replace(",", "."))
+    except Exception:
+        return None
+
+
 @app.post("/extract", response_model=ApiResponse)
 async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiResponse:
     """Extract structured data (name, time, code) from an image URL.
@@ -1091,24 +1124,10 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
     text_top_left_white_en = join_lines(ocr_lines(top_left_white_mask, "en")) if top_left_white_mask is not None else ""
     text_top_left_cyan_en = join_lines(ocr_lines(top_left_cyan_mask, "en")) if top_left_cyan_mask is not None else ""
 
-    seconds = extract_banner_time_seconds(text_banner_en)
-    if seconds is None:
-        _m = re.search(RE_PARSE_TIME_AGAIN, (text_top_right_en or "").upper())
-        if _m:
-            try:
-                seconds = float(_m.group(1).replace(",", "."))
-            except Exception:
-                seconds = None
-    if seconds is None:
-        _m2 = re.search(RE_PARSE_TIME_AGAIN, (text_top_left_white_en or "").upper())
-        if _m2:
-            try:
-                seconds = float(_m2.group(1).replace(",", "."))
-            except Exception:
-                seconds = None
-
+    # ----- CODE -----
     code = extract_code(text_top_left_en, text_top_left_white_en, text_top_left_cyan_en)
 
+    # ----- NAME -----
     name = extract_name(
         image_bottom_left=bottom_left_name,
         image_bottom_left_alt=bottom_left,
@@ -1119,6 +1138,23 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
         text_bottom_left_en=text_bottom_left_en,
         text_top_right_en=text_top_right_en,
     )
+
+    # ----- TIME -----
+    # 1) banner
+    seconds = extract_banner_time_seconds(text_banner_en)
+
+    # 2) fallback TOP5
+    if seconds is None:
+        seconds = extract_time_from_top5_for_name(text_top_right_en, name)
+
+    # 3) last fallback top-left
+    if seconds is None:
+        _m2 = re.search(RE_PARSE_TIME_AGAIN, (text_top_left_white_en or "").upper())
+        if _m2:
+            try:
+                seconds = float(_m2.group(1).replace(",", "."))
+            except Exception:
+                seconds = None
 
     return ApiResponse(
         extracted=ExtractedResult(
