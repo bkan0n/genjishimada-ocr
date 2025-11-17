@@ -877,16 +877,21 @@ def extract_name(  # noqa: PLR0913
 def normalize_map_code(raw_code_text: str | None) -> str | None:
     """Normalize and validate a candidate map code string.
 
-    Removes non-alphanumeric characters, uppercases letters, converts 'O'→'0',
-    enforces length constraints (4-6 chars), and requires at least one digit.
-
+    Rules:
+    - 4–6 alphanumeric characters
+    - must contain at least one real digit BEFORE O→0 normalization
+    - common HUD words and known non-codes are rejected
+    
     Args:
       raw_code_text: Raw OCR string representing a possible map code.
 
     Returns:
       Cleaned map code if valid, otherwise None.
     """
-    if not raw_code_text or raw_code_text in {
+    if not raw_code_text:
+        return None
+
+    GENERIC_BAD = {
         "MADE",
         "BY",
         "TIME",
@@ -899,19 +904,27 @@ def normalize_map_code(raw_code_text: str | None) -> str | None:
         "C0DE",
         "BH0P",
         "BHOP",
-    }:
+        "AUTO",
+    }
+
+    raw_up = raw_code_text.upper()
+    raw_clean = re.sub(RE_BASIC_NORMALIZATION, "", raw_up)
+
+    if raw_clean in GENERIC_BAD:
         return None
-    # Basic normalization
-    raw_code_text = re.sub(RE_BASIC_NORMALIZATION, "", raw_code_text.upper().replace("O", "0"))
-    min_length = 4
-    max_length = 6
-    if not (min_length <= len(raw_code_text) <= max_length):
+
+    # Length must be between 4 and 6
+    if not (4 <= len(raw_clean) <= 6):
         return None
-    # Map codes always contain at least one digit
-    if not any(ch.isdigit() for ch in raw_code_text):
-        # Examples: "KUMA", "MANTA" -> reject
+
+    # Map codes must contain at least one real digit BEFORE replacing O→0
+    if not any(ch.isdigit() for ch in raw_clean):
         return None
-    return raw_code_text
+
+    # Now it is safe to normalize letter O to zero
+    normalized = raw_clean.replace("O", "0")
+
+    return normalized
 
 
 def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_text: str) -> str | None:
@@ -933,7 +946,7 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
 
     # Normalize around "MAP CODE"
     normalized = re.sub(
-        RE_MAP_CODE_NORMALIZATION,  # Matches MAPCODE / MAP C0DE / MAP COOE / MAP LODE / MAP L0DE
+        RE_MAP_CODE_NORMALIZATION,
         "MAP CODE",
         all_text,
     )
@@ -941,10 +954,9 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
     # 1) strict pattern: "MAP CODE: XXXX"
     strict_pattern_match = re.search(RE_MAP_CODE_FULL, normalized)
     if strict_pattern_match:
-        raw = strict_pattern_match.group(1) or ""
-        cleaned = re.sub(RE_BASIC_NORMALIZATION, "", raw.upper().replace("O", "0"))
-        if 4 <= len(cleaned) <= 6 and cleaned not in {"CODE", "C0DE"}:
-            return cleaned
+        candidate = normalize_map_code(strict_pattern_match.group(1) or "")
+        if candidate:
+            return candidate
 
     # 2) if there is "MAP", search in a short window after it
     map_keyword_index = normalized.find("MAP")
@@ -963,7 +975,7 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
             if candidate:
                 return candidate
 
-    # 3) last resort: scan all 4-6 char tokens (bruit max)
+    # 3) last resort: scan all 4–6 char tokens (maximum noise)
     for token in re.findall(RE_MAP_CODE_FIND, normalized):
         if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE"}:
             continue
