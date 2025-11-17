@@ -917,12 +917,12 @@ def normalize_map_code(raw_code_text: str | None) -> str | None:
     if not (4 <= len(raw_clean) <= 6):
         return None
 
-    # Map codes must contain at least one real digit BEFORE replacing O→0
-    if not any(ch.isdigit() for ch in raw_clean):
-        return None
-
     # Now it is safe to normalize letter O to zero
     normalized = raw_clean.replace("O", "0")
+
+    # Map codes must contain at least one real digit BEFORE replacing O→0 (for normalized version)
+    if not any(ch.isdigit() for ch in normalized):
+        return None
 
     return normalized
 
