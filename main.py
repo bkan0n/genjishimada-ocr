@@ -874,7 +874,7 @@ def extract_name(  # noqa: PLR0913
     return None
 
 
-def normalize_map_code(raw_code_text: str | None) -> str | None:
+def normalize_map_code(raw_code_text: str | None, require_digit: bool = True) -> str | None:
     """Normalize and validate a candidate map code string.
 
     Rules:
@@ -917,11 +917,11 @@ def normalize_map_code(raw_code_text: str | None) -> str | None:
     if not (4 <= len(raw_clean) <= 6):
         return None
 
-    # Now it is safe to normalize letter O to zero
+    # Normalize letter O to zero
     normalized = raw_clean.replace("O", "0")
 
-    # Map codes must contain at least one real digit BEFORE replacing O→0 (for normalized version)
-    if not any(ch.isdigit() for ch in normalized):
+    # Optionally require at least one digit (for noisy global scan)
+    if require_digit and not any(ch.isdigit() for ch in normalized):
         return None
 
     return normalized
@@ -954,7 +954,8 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
     # 1) strict pattern: "MAP CODE: XXXX"
     strict_pattern_match = re.search(RE_MAP_CODE_FULL, normalized)
     if strict_pattern_match:
-        candidate = normalize_map_code(strict_pattern_match.group(1) or "")
+        # Codes that appear directly after "MAP CODE" can be all letters (QBSZF, ABCDE, etc.)
+        candidate = normalize_map_code(strict_pattern_match.group(1) or "", require_digit=False)
         if candidate:
             return candidate
 
@@ -965,21 +966,22 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
 
         short_pattern_match = re.search(RE_MAP_CODE_SHORT, search_window)
         if short_pattern_match:
-            candidate = normalize_map_code(short_pattern_match.group(1))
+            candidate = normalize_map_code(short_pattern_match.group(1), require_digit=False)
             if candidate:
                 return candidate
 
         loose_pattern_match = re.search(RE_MAP_CODE_CAPTURE, search_window)
         if loose_pattern_match:
-            candidate = normalize_map_code(loose_pattern_match.group(1))
+            candidate = normalize_map_code(loose_pattern_match.group(1), require_digit=False)
             if candidate:
                 return candidate
 
-    # 3) last resort: scan all 4–6 char tokens (maximum noise)
+    # 3) last resort: scan all 4–6 char tokens (maximum noise).
+    # Here we keep require_digit=True to avoid picking random HUD words.
     for token in re.findall(RE_MAP_CODE_FIND, normalized):
         if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE"}:
             continue
-        candidate = normalize_map_code(token)
+        candidate = normalize_map_code(token, require_digit=True)
         if candidate:
             return candidate
 
