@@ -43,11 +43,13 @@ RE_PARSE_TIME_AGAIN = re.compile(r"\b(\d{1,4}[.,]\d{2})\s*SEC")
 
 RE_SPACES = re.compile(r"\s+")
 
+RE_PARSE_TOPLEFT_TIME_ANY = re.compile(r"\b(\d{1,5}[.,]\d{2})\s*(?:SEC|초)?", re.IGNORECASE)
+
 RE_ASCII_NAME_MATCH = re.compile(r"[A-Z][A-Z0-9_]{2,23}")
 RE_XYZ_MISSION_COMPLETE = re.compile(r"([A-Z][A-Z0-9_]{2,24})\s+MISSION\s+COMPLETE")
 RE_GET_USER_NAME_FROM_TOP_5 = re.compile(r"\b([A-Z][A-Z0-9_]{2,24})\b.*?(\d{1,4}[.,]\d{2})\s*SEC")
 
-RE_TOP5_TIME_FOR_NAME = re.compile(r"\b([A-Z][A-Z0-9_]{2,24})\b\s+(\d{1,4}[.,]\d{2})\s*SEC")
+RE_TOP5_TIME_FOR_NAME = re.compile(r"\b([A-Z][A-Z0-9_]{2,24})\b\s+(\d{1,5}[.,]\d{2})\s*(?:SEC|초)?", re.IGNORECASE,)
 RE_MAP_CODE_FULL = re.compile(r"MAP\s*(?:C(?:O|0)?DE)\s*[:\-]?\s*([A-Z0-9]{4,6})\b")
 RE_MAP_CODE_SHORT = re.compile(r"(?:C(?:O|0)?DE)\s*[:\-]?\s*([A-Z0-9]{4,6})\b")
 RE_MAP_CODE_CAPTURE = re.compile(r"\b([A-Z0-9]{4,6})\b")
@@ -933,7 +935,8 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
 
     Merges text from multiple ROIs, normalizes "MAP CODE" variants, and searches
     for patterns in decreasing strictness: explicit "MAP CODE: XXXX", short-range
-    context after "MAP", or generic 4-6 character alphanumeric tokens.
+    context after "MAP", or generic 4–6 character alphanumeric tokens with
+    scoring based on frequency and textual context.
 
     Args:
       top_left_text: OCR text from the top-left region.
@@ -945,12 +948,8 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
     """
     all_text = " ".join([top_left_text or "", top_left_white_text or "", top_left_cyan_text or ""]).upper()
 
-    # Normalize around "MAP CODE"
-    normalized = re.sub(
-        RE_MAP_CODE_NORMALIZATION,
-        "MAP CODE",
-        all_text,
-    )
+    # Normalize around "MAP CODE" (MAP C0DE / MAP CLDDE / etc.).
+    normalized = re.sub(RE_MAP_CODE_NORMALIZATION, "MAP CODE", all_text)
 
     # 1) strict pattern: "MAP CODE: XXXX"
     strict_pattern_match = re.search(RE_MAP_CODE_FULL, normalized)
@@ -977,17 +976,64 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
             if candidate:
                 return candidate
 
-    # 3) last resort: scan all 4–6 char tokens (maximum noise).
-    # Here we keep require_digit=True to avoid picking random HUD words.
-    for token in re.findall(RE_MAP_CODE_FIND, normalized):
-        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE"}:
+    # 3) last resort: scan all 4–6 char tokens (maximum noise) and score them.
+    # We aggregate scores per candidate based on frequency and local context.
+    scores: dict[str, float] = defaultdict(float)
+
+    for m in re.finditer(RE_MAP_CODE_FIND, normalized):
+        token = m.group(0)
+
+        # Skip obvious HUD words.
+        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE", "AUTO", "AUT0"}:
             continue
+
         candidate = normalize_map_code(token, require_digit=True)
-        if candidate:
-            return candidate
+        if not candidate:
+            continue
 
-    return None
+        # Base score for each occurrence.
+        score = 1.0
 
+        has_letter = any(c.isalpha() for c in candidate)
+        has_digit = any(c.isdigit() for c in candidate)
+
+        # Mixed letter+digit codes are common (AA3JT, Z2JHS, ...).
+        if has_letter and has_digit:
+            score += 1.0
+        # Pure digit codes are also valid (86764, 12345, ...).
+        elif has_digit:
+            score += 0.7
+
+        # Context window around the token.
+        before = normalized[max(0, m.start() - 20) : m.start()]
+        after = normalized[m.end() : m.end() + 20]
+
+        # Bonus if the code is directly after ":" (e.g. "CODE: 86764").
+        if ":" in before[-3:]:
+            score += 0.8
+
+        # Bonus if near "MAP" / "CODE" keywords.
+        if "MAP" in before[-15:] or "MAP" in after[:15]:
+            score += 1.0
+        if "CODE" in before[-15:] or "CODE" in after[:15]:
+            score += 1.0
+
+        # Penalty if clearly tied to TIME / SEC → likely a time fragment.
+        if "TIME" in before[-15:] or "SEC" in after[:10]:
+            score -= 1.0
+
+        scores[candidate] += score
+
+    if not scores:
+        return None
+
+    # Pick the candidate with the best global score.
+    # Tie-breaker: prefer more digits (real codes often have ≥2 digits).
+    best_code, _ = max(
+        scores.items(),
+        key=lambda kv: (kv[1], sum(c.isdigit() for c in kv[0]))
+    )
+    return best_code
 
 class ImageBase64Payload(BaseModel):
     """Pydantic model for a base64-encoded image payload.
@@ -1200,11 +1246,18 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
     # 3) Candidate from the top-left (white + normal)
     cand_top_left: float | None = None
     try:
-        # Combine white + normal top-left text to maximize chances
-        tl_source = f"{text_top_left_white_en or ''} {text_top_left_en or ''}"
-        _m2 = re.search(RE_PARSE_TIME_AGAIN, tl_source.upper())
+        # Merge white + normal to maximize chances
+        tl_source = f"{text_top_left_white_en or ''} {text_top_left_en or ''}".upper()
+
+        # Legacy strict pattern with "SEC"
+        _m2 = re.search(RE_PARSE_TIME_AGAIN, tl_source)
         if _m2:
             cand_top_left = float(_m2.group(1).replace(",", "."))
+        else:
+            # Loose pattern that also handles Korean "초"
+            _m3 = re.search(RE_PARSE_TOPLEFT_TIME_ANY, tl_source)
+            if _m3:
+                cand_top_left = float(_m3.group(1).replace(",", "."))
     except Exception:
         cand_top_left = None
 
@@ -1216,7 +1269,7 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
     )
     
     # Safety clamp: time must not exceed 13k seconds
-    if seconds is not None and seconds > 13000:
+    if seconds is not None and seconds > 15360:
       seconds = None
 
     return ApiResponse(
