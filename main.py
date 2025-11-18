@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Request
 from paddleocr import PaddleOCR
 from PIL import Image, ImageFile
 from pydantic import BaseModel, ConfigDict, HttpUrl
+from collections import defaultdict
 
 # --- CPU safe flags (MKL/oneDNN off, thread caps) ---
 os.environ.setdefault("OPENBLAS_CORETYPE", "NEHALEM")
@@ -1044,7 +1045,43 @@ def ping() -> dict:
     return {"ok": True, "models": sorted(OCR_ENGINES.keys())}
 
 
-# ---------- HELPER FALLBACK TIME TOP5 ----------
+# ---------- HELPERS TIME ----------
+def resolve_best_time_candidate(
+    banner_time: float | None,
+    top5_time: float | None,
+    top_left_time: float | None,
+) -> float | None:
+    """Combine different time candidates (banner, TOP5, top-left)
+    and return the most likely value.
+
+    Uses a simple weighted voting system:
+      - banner < top_left < top5
+    """
+    values: list[float] = []
+    weights: list[float] = []
+
+    for t, w in (
+        (banner_time, 1.0),   # banner: can be noisy
+        (top_left_time, 1.2), # top-left: usually stable
+        (top5_time, 1.5),     # TOP5: often the cleanest
+    ):
+        if t is None or t <= 0:
+            continue
+        values.append(round(t, 2))
+        weights.append(w)
+
+    if not values:
+        return None
+
+    scores: dict[float, float] = defaultdict(float)
+    for v, w in zip(values, weights):
+        scores[v] += w
+
+    # Pick the value with the highest score.
+    # If scores are equal, prefer the larger time (usually more realistic).
+    best_value, _ = max(scores.items(), key=lambda kv: (kv[1], kv[0]))
+    return float(best_value)
+
 def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) -> float | None:
     """Extract the correct time from TOP5 for the given player name.
 
@@ -1154,21 +1191,29 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
     )
 
     # ----- TIME -----
-    # 1) banner
-    seconds = extract_banner_time_seconds(text_banner_en)
+    # 1) Candidate from the banner
+    cand_banner = extract_banner_time_seconds(text_banner_en)
 
-    # 2) fallback TOP5
-    if seconds is None:
-        seconds = extract_time_from_top5_for_name(text_top_right_en, name)
+    # 2) Candidate from TOP5 (for the detected player name)
+    cand_top5 = extract_time_from_top5_for_name(text_top_right_en, name)
 
-    # 3) last fallback top-left
-    if seconds is None:
-        _m2 = re.search(RE_PARSE_TIME_AGAIN, (text_top_left_white_en or "").upper())
+    # 3) Candidate from the top-left (white + normal)
+    cand_top_left: float | None = None
+    try:
+        # Combine white + normal top-left text to maximize chances
+        tl_source = f"{text_top_left_white_en or ''} {text_top_left_en or ''}"
+        _m2 = re.search(RE_PARSE_TIME_AGAIN, tl_source.upper())
         if _m2:
-            try:
-                seconds = float(_m2.group(1).replace(",", "."))
-            except Exception:
-                seconds = None
+            cand_top_left = float(_m2.group(1).replace(",", "."))
+    except Exception:
+        cand_top_left = None
+
+    # 4) Resolve the final time using all candidates
+    seconds = resolve_best_time_candidate(
+        banner_time=cand_banner,
+        top5_time=cand_top5,
+        top_left_time=cand_top_left,
+    )
 
     return ApiResponse(
         extracted=ExtractedResult(
