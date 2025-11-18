@@ -1214,6 +1214,10 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
         top5_time=cand_top5,
         top_left_time=cand_top_left,
     )
+    
+    # Safety clamp: time must not exceed 13k seconds
+    if seconds is not None and seconds > 13000:
+      seconds = None
 
     return ApiResponse(
         extracted=ExtractedResult(
