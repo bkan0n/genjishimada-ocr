@@ -1146,9 +1146,12 @@ def resolve_best_time_candidate(
 def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) -> float | None:
     """Extract the correct time from TOP5 for the given player name.
 
-    - If `name` is known, use the time shown under that username, using a relaxed
-      name comparison that tolerates OCR mistakes like BRATISHKA7 vs BRAT1SHKA7.
-    - Otherwise, fall back to the first match.
+    Behavior:
+      - If `name` is known, only use the time for that player (relaxed comparison
+        to tolerate OCR mistakes like BRATISHKA7 vs BRAT1SHKA7).
+      - If `name` is unknown (None), fall back to the first TOP5 entry.
+      - If `name` is known but no matching TOP5 row is found, return None so that
+        other sources (top-left HUD, banner) can decide the final time.
     """
     if not text_top_right_en:
         return None
@@ -1158,7 +1161,7 @@ def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) ->
     if not matches:
         return None
 
-    # If name is known, try to match its TOP5 entry with relaxed comparison
+    # If we know the player's name, only trust a TOP5 row that matches it
     if name:
         target_norm = _normalize_name_for_compare(name)
         for m in matches:
@@ -1170,12 +1173,14 @@ def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) ->
                 except Exception:
                     return None
 
-    # Fallback: use the first match
+        # No TOP5 row matched this player → do NOT fall back to another player
+        return None
+
+    # If name is unknown, we can still use the first TOP5 row as a generic fallback
     try:
         return float(matches[0].group(2).replace(",", "."))
     except Exception:
         return None
-
 
 @app.post("/extract", response_model=ApiResponse)
 async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiResponse:
