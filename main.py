@@ -246,8 +246,8 @@ def log_model_dirs() -> None:
 
 ROI_TOPLEFT = [0.010, 0.020, 0.360, 0.300]
 ROI_TOPLEFT_WIDE = [0.005, 0.010, 0.420, 0.340]
-ROI_BANNER_TIGHT = [0.220, 0.180, 0.780, 0.360]
-ROI_TOPRIGHT = [0.800, 0.170, 0.985, 0.470]
+ROI_BANNER_TIGHT = [0.212, 0.184, 0.788, 0.380]
+ROI_TOPRIGHT = [0.800, 0.111, 0.985, 0.470]
 ROI_BOTTOMLEFT = [0.050, 0.825, 0.330, 0.990]
 ROI_NAME_SPECIFIC = [0.050, 0.800, 0.400, 0.900]
 
@@ -688,6 +688,20 @@ def ocr_with_labels(image: np.ndarray, language_code: LanguageCode, roi_label: R
         )
     return out
 
+def _normalize_name_for_compare(name: str) -> str:
+    """Normalize a name so that common OCR confusions (1/I, 0/O, 5/S, 8/B, 2/Z)
+    are treated as the same when comparing names between HUD regions.
+    """
+    s = (name or "").upper()
+    # Map digits that are typically OCR mistakes back to letters
+    s = (
+        s.replace("0", "O")
+        .replace("1", "I")
+        .replace("5", "S")
+        .replace("8", "B")
+        .replace("2", "Z")
+    )
+    return s
 
 def select_best_name_candidate(candidates: list[OcrCandidate]) -> str | None:
     """Select the best candidate name among multiple OCR detections.
@@ -1097,19 +1111,20 @@ def resolve_best_time_candidate(
     top5_time: float | None,
     top_left_time: float | None,
 ) -> float | None:
-    """Combine different time candidates (banner, TOP5, top-left)
-    and return the most likely value.
+    """Combine different time candidates (banner, TOP5, top-left) and pick the best.
 
-    Uses a simple weighted voting system:
-      - banner < top_left < top5
+    We use a weighted vote:
+      - banner: 1.0  (often noisy or for another player)
+      - top-left: 1.2 (main HUD time, usually stable)
+      - TOP5: 1.5 (clean per-player entry when available)
     """
     values: list[float] = []
     weights: list[float] = []
 
     for t, w in (
-        (banner_time, 1.0),   # banner: can be noisy
-        (top_left_time, 1.2), # top-left: usually stable
-        (top5_time, 1.5),     # TOP5: often the cleanest
+        (banner_time, 1.0),
+        (top_left_time, 1.2),
+        (top5_time, 1.5),
     ):
         if t is None or t <= 0:
             continue
@@ -1131,8 +1146,9 @@ def resolve_best_time_candidate(
 def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) -> float | None:
     """Extract the correct time from TOP5 for the given player name.
 
-    - If `name` is known, use the time *shown under that username*.
-    - Otherwise, fall back to the first match (previous behavior).
+    - If `name` is known, use the time shown under that username, using a relaxed
+      name comparison that tolerates OCR mistakes like BRATISHKA7 vs BRAT1SHKA7.
+    - Otherwise, fall back to the first match.
     """
     if not text_top_right_en:
         return None
@@ -1142,17 +1158,19 @@ def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) ->
     if not matches:
         return None
 
-    # If name, search matching entry
+    # If name is known, try to match its TOP5 entry with relaxed comparison
     if name:
-        target = name.upper()
+        target_norm = _normalize_name_for_compare(name)
         for m in matches:
-            if m.group(1) == target:
+            cand_name = m.group(1)
+            cand_norm = _normalize_name_for_compare(cand_name)
+            if cand_norm == target_norm:
                 try:
                     return float(m.group(2).replace(",", "."))
                 except Exception:
                     return None
 
-    # Fallback
+    # Fallback: use the first match
     try:
         return float(matches[0].group(2).replace(",", "."))
     except Exception:
@@ -1207,22 +1225,45 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
 
     banner_white_mask = mask_white_regions(banner)
     banner_gray = enhance_contrast_grayscale(banner)
-    banner_binary = cv2.adaptiveThreshold(banner_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9)
+    banner_binary = cv2.adaptiveThreshold(
+        banner_gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        9,
+    )
 
     text_banner_en = join_lines(
-        ocr_lines(banner, "en") + ocr_lines(banner_white_mask, "en") + ocr_lines(banner_binary, "en")
+        ocr_lines(banner, "en")
+        + ocr_lines(banner_white_mask, "en")
+        + ocr_lines(banner_binary, "en")
     )
     text_top_right_en = join_lines(ocr_lines(top_right, "en"))
     text_bottom_left_en = join_lines(ocr_lines(bottom_left, "en"))
-    text_top_left_en = join_lines(ocr_lines(top_left, "en") + ocr_lines(top_left_wide, "en"))
+    text_top_left_en = join_lines(
+        ocr_lines(top_left, "en") + ocr_lines(top_left_wide, "en")
+    )
 
     top_left_white_mask = mask_white_regions(top_left_wide)
     top_left_cyan_mask = mask_cyan_regions(top_left_wide)
-    text_top_left_white_en = join_lines(ocr_lines(top_left_white_mask, "en")) if top_left_white_mask is not None else ""
-    text_top_left_cyan_en = join_lines(ocr_lines(top_left_cyan_mask, "en")) if top_left_cyan_mask is not None else ""
+    text_top_left_white_en = (
+        join_lines(ocr_lines(top_left_white_mask, "en"))
+        if top_left_white_mask is not None
+        else ""
+    )
+    text_top_left_cyan_en = (
+        join_lines(ocr_lines(top_left_cyan_mask, "en"))
+        if top_left_cyan_mask is not None
+        else ""
+    )
 
     # ----- CODE -----
-    code = extract_code(text_top_left_en, text_top_left_white_en, text_top_left_cyan_en)
+    code = extract_code(
+        text_top_left_en,
+        text_top_left_white_en,
+        text_top_left_cyan_en,
+    )
 
     # ----- NAME -----
     name = extract_name(
@@ -1237,27 +1278,35 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
     )
 
     # ----- TIME -----
-    # 1) Candidate from the banner
+    # 1) Candidate from the banner (may belong to another player)
     cand_banner = extract_banner_time_seconds(text_banner_en)
 
-    # 2) Candidate from TOP5 (for the detected player name)
+    # 2) Candidate from TOP5 for the detected player
     cand_top5 = extract_time_from_top5_for_name(text_top_right_en, name)
 
-    # 3) Candidate from the top-left (white + normal)
+    # 3) Candidate from the top-left (main HUD block)
     cand_top_left: float | None = None
     try:
         # Merge white + normal to maximize chances
         tl_source = f"{text_top_left_white_en or ''} {text_top_left_en or ''}".upper()
 
-        # Legacy strict pattern with "SEC"
-        _m2 = re.search(RE_PARSE_TIME_AGAIN, tl_source)
-        if _m2:
-            cand_top_left = float(_m2.group(1).replace(",", "."))
+        # First, strict pattern with "SEC"
+        m_strict = re.search(RE_PARSE_TIME_AGAIN, tl_source)
+        if m_strict:
+            cand_top_left = float(m_strict.group(1).replace(",", "."))
         else:
-            # Loose pattern that also handles Korean "초"
-            _m3 = re.search(RE_PARSE_TOPLEFT_TIME_ANY, tl_source)
-            if _m3:
-                cand_top_left = float(_m3.group(1).replace(",", "."))
+            # Collect *all* loose time-like tokens and take the largest one.
+            # This avoids picking split time (44.60) instead of main time (2175.11).
+            values: list[float] = []
+            for m in re.finditer(RE_PARSE_TOPLEFT_TIME_ANY, tl_source):
+                try:
+                    val = float(m.group(1).replace(",", "."))
+                    if val > 0:
+                        values.append(val)
+                except Exception:
+                    continue
+            if values:
+                cand_top_left = max(values)
     except Exception:
         cand_top_left = None
 
@@ -1267,10 +1316,10 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
         top5_time=cand_top5,
         top_left_time=cand_top_left,
     )
-    
-    # Safety clamp: time must not exceed 13k seconds
+
+    # Safety clamp: ignore absurdly large times (> ~4.27h)
     if seconds is not None and seconds > 15360:
-      seconds = None
+        seconds = None
 
     return ApiResponse(
         extracted=ExtractedResult(
