@@ -54,6 +54,8 @@ RE_MAP_CODE_FULL = re.compile(r"MAP\s*(?:C(?:O|0)?DE)\s*[:\-]?\s*([A-Z0-9]{4,6})
 RE_MAP_CODE_SHORT = re.compile(r"(?:C(?:O|0)?DE)\s*[:\-]?\s*([A-Z0-9]{4,6})\b")
 RE_MAP_CODE_CAPTURE = re.compile(r"\b([A-Z0-9]{4,6})\b")
 RE_MAP_CODE_FIND = re.compile(r"\b[A-Z0-9]{4,6}\b")
+RE_CODE_KEYWORD_EXTRACT = re.compile(r"(?:MAP\s+)?C(?:O|0)?DE\s*[:\-]?\s*([A-Z0-9]{4,6})\b", re.IGNORECASE,)
+RE_CODE_AFTER_COLON = re.compile(r":\s*([A-Z0-9]{4,6})\b", re.IGNORECASE,)
 
 RE_BASIC_NORMALIZATION = re.compile(r"[^A-Z0-9]")
 RE_MAP_CODE_NORMALIZATION = re.compile(r"MAP\s*[CLO0][O0D]{2}E", flags=re.IGNORECASE)
@@ -922,9 +924,17 @@ def normalize_map_code(raw_code_text: str | None, require_digit: bool = True) ->
         "BH0P",
         "BHOP",
         "AUTO",
+        "MANTA",
+        "KUMA",
+        "WUHZI",
     }
 
-    raw_up = raw_code_text.upper()
+    raw_up = (raw_code_text or "").upper()
+
+    # Avoid times fragments like "00SEC"
+    if raw_up.endswith("SEC"):
+        return None
+
     raw_clean = re.sub(RE_BASIC_NORMALIZATION, "", raw_up)
 
     if raw_clean in GENERIC_BAD:
@@ -962,90 +972,96 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
     """
     all_text = " ".join([top_left_text or "", top_left_white_text or "", top_left_cyan_text or ""]).upper()
 
-    # Normalize around "MAP CODE" (MAP C0DE / MAP CLDDE / etc.).
+    # Normalize "MAP C0DE" / "MAP CLDDE" etc. into "MAP CODE"
     normalized = re.sub(RE_MAP_CODE_NORMALIZATION, "MAP CODE", all_text)
 
-    # 1) strict pattern: "MAP CODE: XXXX"
-    strict_pattern_match = re.search(RE_MAP_CODE_FULL, normalized)
-    if strict_pattern_match:
-        # Codes that appear directly after "MAP CODE" can be all letters (QBSZF, ABCDE, etc.)
-        candidate = normalize_map_code(strict_pattern_match.group(1) or "", require_digit=False)
+    # 1) Keyword-based detection: "MAP CODE" / "CODE" (MAP prefix is optional)
+    m_keyword = re.search(RE_CODE_KEYWORD_EXTRACT, normalized)
+    if m_keyword:
+        candidate = normalize_map_code(m_keyword.group(1) or "", require_digit=False)
         if candidate:
             return candidate
 
-    # 2) if there is "MAP", search in a short window after it
-    map_keyword_index = normalized.find("MAP")
-    if map_keyword_index != -1:
-        search_window = normalized[map_keyword_index : map_keyword_index + 80]
+    # 2) Generic pattern ":[space]XXXX" (very useful for Korean/Japanese HUDs like "맵 코드: 1DDP2")
+    colon_candidates: dict[str, int] = {}
+    for m in re.finditer(RE_CODE_AFTER_COLON, normalized):
+        token = m.group(1) or ""
+        cand = normalize_map_code(token, require_digit=False)
+        if not cand:
+            continue
 
-        short_pattern_match = re.search(RE_MAP_CODE_SHORT, search_window)
-        if short_pattern_match:
-            candidate = normalize_map_code(short_pattern_match.group(1), require_digit=False)
-            if candidate:
-                return candidate
+        # Avoid pure numeric tokens here (they are usually times like 2497, 3561)
+        if not any(ch.isalpha() for ch in cand):
+            continue
 
-        loose_pattern_match = re.search(RE_MAP_CODE_CAPTURE, search_window)
-        if loose_pattern_match:
-            candidate = normalize_map_code(loose_pattern_match.group(1), require_digit=False)
-            if candidate:
-                return candidate
+        colon_candidates[cand] = colon_candidates.get(cand, 0) + 1
 
-    # 3) last resort: scan all 4–6 char tokens (maximum noise) and score them.
-    # We aggregate scores per candidate based on frequency and local context.
-    scores: dict[str, float] = defaultdict(float)
+    if colon_candidates:
+        # Prefer the most frequent candidate that appears after a colon
+        best_colon_code, _ = max(colon_candidates.items(), key=lambda kv: kv[1])
+        return best_colon_code
+
+    # 3) Global fallback: scan all 4–6 char tokens and score them
+    scores_all: dict[str, float] = defaultdict(float)
+    scores_with_letter: dict[str, float] = defaultdict(float)
 
     for m in re.finditer(RE_MAP_CODE_FIND, normalized):
         token = m.group(0)
 
-        # Skip obvious HUD words.
-        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE", "AUTO", "AUT0"}:
+        # Skip obvious HUD words
+        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE", "AUTO", "AUT0", "MANTA", "KUMA", "WUHZI"}:
             continue
 
         candidate = normalize_map_code(token, require_digit=True)
         if not candidate:
             continue
 
-        # Base score for each occurrence.
-        score = 1.0
-
         has_letter = any(c.isalpha() for c in candidate)
         has_digit = any(c.isdigit() for c in candidate)
 
-        # Mixed letter+digit codes are common (AA3JT, Z2JHS, ...).
+        # Base score per occurrence
+        score = 1.0
+
+        # Mixed letter+digit codes are the most typical (AA3JT, Z2JHS, 1DDP2, ...)
         if has_letter and has_digit:
             score += 1.0
-        # Pure digit codes are also valid (86764, 12345, ...).
+        # Pure digit codes are possible but less likely for global fallback
         elif has_digit:
             score += 0.7
 
-        # Context window around the token.
+        # Context window around the token
         before = normalized[max(0, m.start() - 20) : m.start()]
         after = normalized[m.end() : m.end() + 20]
 
-        # Bonus if the code is directly after ":" (e.g. "CODE: 86764").
+        # Bonus if we are directly after a colon, e.g. "CODE: 86764"
         if ":" in before[-3:]:
             score += 0.8
 
-        # Bonus if near "MAP" / "CODE" keywords.
+        # Bonus if near "MAP" / "CODE" keywords
         if "MAP" in before[-15:] or "MAP" in after[:15]:
             score += 1.0
         if "CODE" in before[-15:] or "CODE" in after[:15]:
             score += 1.0
 
-        # Penalty if clearly tied to TIME / SEC → likely a time fragment.
+        # Penalty if clearly linked to TIME/SEC → likely a time fragment
         if "TIME" in before[-15:] or "SEC" in after[:10]:
             score -= 1.0
 
-        scores[candidate] += score
+        scores_all[candidate] += score
+        if has_letter:
+            scores_with_letter[candidate] += score
 
-    if not scores:
+    if not scores_all:
         return None
 
-    # Pick the candidate with the best global score.
-    # Tie-breaker: prefer more digits (real codes often have ≥2 digits).
+    # If we have at least one candidate with letters, ignore purely numeric ones
+    # in this fallback. Pure numeric codes are still discoverable via the more
+    # explicit patterns above (keyword / colon-based).
+    pool = scores_with_letter if scores_with_letter else scores_all
+
     best_code, _ = max(
-        scores.items(),
-        key=lambda kv: (kv[1], sum(c.isdigit() for c in kv[0]))
+        pool.items(),
+        key=lambda kv: (kv[1], sum(c.isdigit() for c in kv[0])),
     )
     return best_code
 
