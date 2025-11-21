@@ -39,11 +39,11 @@ RE_PARSE_BANNER_TIME_SEARCH_WITH_SEC = re.compile(r"([0-9OQDBZGISL\,\.]{3,12})\s
 RE_PARSE_BANNER_TIME_SEARCH_NO_SEC = re.compile(r"([0-9OQDBZGISL\,\.]{3,12})")
 RE_PARSE_BANNER_TIME_SEARCH_ONLY_SEC = re.compile(r"(SEC|초)")
 RE_CLEAN_BANNER_FRAGMENT = re.compile(r"\s{2,}")
-RE_PARSE_TIME_AGAIN = re.compile(r"\b(\d{1,4}[.,]\d{2})\s*SEC")
+RE_PARSE_TIME_AGAIN = re.compile(r"(?<![0-9.,])(\d{1,4}[.,]\d{2})\s*SEC")
 
 RE_SPACES = re.compile(r"\s+")
 
-RE_PARSE_TOPLEFT_TIME_ANY = re.compile(r"\b(\d{1,5}[.,]\d{2})\s*(?:SEC|초)?", re.IGNORECASE)
+RE_PARSE_TOPLEFT_TIME_ANY = re.compile(r"(?<![0-9.,])(\d{1,5}[.,]\d{2})\s*(?:SEC|초)?", re.IGNORECASE,)
 
 RE_ASCII_NAME_MATCH = re.compile(r"[A-Z][A-Z0-9_]{2,23}")
 RE_XYZ_MISSION_COMPLETE = re.compile(r"([A-Z][A-Z0-9_]{2,24})\s+MISSION\s+COMPLETE")
@@ -815,6 +815,33 @@ def ascii_name_from_banner_or_top_right(text_banner_en: str, text_top_right_en: 
 
     return None
 
+def preprocess_name_roi_for_cjk(image_bgr: np.ndarray) -> np.ndarray:
+    """Upscale + slight sharpening for CJK name ROI to help OCR.
+
+    Only used for Korean / Japanese / Chinese bottom-left HUD,
+    where text is small and dense.
+    """
+    if image_bgr is None or image_bgr.size == 0:
+        return image_bgr
+
+    h, w = image_bgr.shape[:2]
+    # If already large enough, don't overdo it
+    scale = 2.0 if min(h, w) < 120 else 1.5
+
+    # Upscale
+    up = cv2.resize(
+        image_bgr,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    # Light sharpening (unsharp mask)
+    blur = cv2.GaussianBlur(up, (0, 0), 1.0)
+    sharp = cv2.addWeighted(up, 1.5, blur, -0.5, 0)
+
+    return sharp
 
 def extract_name(  # noqa: PLR0913
     image_bottom_left: np.ndarray,
@@ -853,39 +880,51 @@ def extract_name(  # noqa: PLR0913
     Returns:
       Final extracted player name string, or None if no valid name is detected.
     """
-    # 1. ASCII candidate from bottom-left HUD
+    # 1. ASCII candidate from bottom-left HUD (English OCR)
     ascii_bottom_left = ascii_name_from_bottom_left(text_bottom_left_en)
 
-    # 2. CJK candidates (BL + banner)
+    # 2. CJK candidates (bottom-left + banner)
+    bl_cjk      = preprocess_name_roi_for_cjk(image_bottom_left)
+    bl_cjk_alt  = preprocess_name_roi_for_cjk(image_bottom_left_alt)
+
     candidates: list[OcrCandidate] = []
     for language_code in get_args(LanguageCode):
         if language_code == "en":
             continue
-        candidates += ocr_with_labels(image_bottom_left, language_code, "BL")
-        candidates += ocr_with_labels(image_bottom_left_alt, language_code, "BL")
-        candidates += ocr_with_labels(image_banner, language_code, "BAN")
-        candidates += ocr_with_labels(image_banner_white, language_code, "BAN")
+
+        if language_code in ("korean", "japan", "ch"):
+            # Use enhanced crops for CJK
+            candidates += ocr_with_labels(bl_cjk,     language_code, "BL")
+            candidates += ocr_with_labels(bl_cjk_alt, language_code, "BL")
+        else:
+            candidates += ocr_with_labels(image_bottom_left,     language_code, "BL")
+            candidates += ocr_with_labels(image_bottom_left_alt, language_code, "BL")
+
+        candidates += ocr_with_labels(image_banner,        language_code, "BAN")
+        candidates += ocr_with_labels(image_banner_white,  language_code, "BAN")
         candidates += ocr_with_labels(image_banner_binary, language_code, "BAN")
 
     # 2.a. CJK candidate specifically in bottom-left HUD
     candidates_bottom_left = [c for c in candidates if c.roi_label == "BL"]
     name_cjk_bottom_left = select_best_name_candidate(candidates_bottom_left)
+    cjk_bl_chars = count_cjk_characters(name_cjk_bottom_left) if name_cjk_bottom_left else 0
 
-    # IMPORTANT:
-    # - if we have a real CJK name in BL (≥2 CJK chars) AND NO ASCII BL name,
-    #   use it (full Korean/Japanese HUD case).
-    if name_cjk_bottom_left and count_cjk_characters(name_cjk_bottom_left) >= 2 and not ascii_bottom_left:
+    # If we have a strong CJK name in bottom-left (≥ 2 CJK chars), always prefer it.
+    # This avoids cases where the English OCR "invented" an ASCII name like OMEI
+    # from Korean text such as 마스터.
+    if name_cjk_bottom_left and cjk_bl_chars >= 2:
         return name_cjk_bottom_left
 
-    # - otherwise, if we have an ASCII BL name, it wins over everything (DAHMX here).
+    # Otherwise, if we have a clean ASCII bottom-left name, let it win.
     if ascii_bottom_left:
         return ascii_bottom_left
 
-    # 3. Global fallback (banner / TOP5 / etc.)
+    # 3. Global ASCII fallback from banner / TOP5
     ascii_other = ascii_name_from_banner_or_top_right(text_banner_en, text_top_right_en)
     if ascii_other:
         return ascii_other
 
+    # 4. Global CJK fallback (any region)
     name_cjk_all = select_best_name_candidate(candidates)
     if name_cjk_all and count_cjk_characters(name_cjk_all) >= 2:
         return name_cjk_all
