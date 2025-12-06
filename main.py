@@ -4,6 +4,15 @@ import base64
 import io
 import logging
 import os
+
+os.environ.setdefault("CPU_RUNTIME_CACHE_CAPACITY", "20")
+# --- CPU safe flags (MKL/oneDNN off, thread caps) ---
+os.environ.setdefault("OPENBLAS_CORETYPE", "NEHALEM")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,13 +26,6 @@ from paddleocr import PaddleOCR
 from PIL import Image, ImageFile
 from pydantic import BaseModel, ConfigDict, HttpUrl
 from collections import defaultdict
-
-# --- CPU safe flags (MKL/oneDNN off, thread caps) ---
-os.environ.setdefault("OPENBLAS_CORETYPE", "NEHALEM")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("FLAGS_use_mkldnn", "0")
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
