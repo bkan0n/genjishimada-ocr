@@ -45,18 +45,29 @@ RE_PARSE_TIME_AGAIN = re.compile(r"(?<![0-9.,])(\d{1,4}[.,]\d{2})\s*SEC")
 
 RE_SPACES = re.compile(r"\s+")
 
-RE_PARSE_TOPLEFT_TIME_ANY = re.compile(r"(?<![0-9.,])(\d{1,5}[.,]\d{2})\s*(?:SEC|초)?", re.IGNORECASE,)
+RE_PARSE_TOPLEFT_TIME_ANY = re.compile(
+    r"(?<![0-9.,])(\d{1,5}[.,]\d{2})\s*(?:SEC|초)?",
+    re.IGNORECASE,
+)
 
 RE_ASCII_NAME_MATCH = re.compile(r"[A-Z][A-Z0-9_]{2,23}")
 RE_XYZ_MISSION_COMPLETE = re.compile(r"([A-Z][A-Z0-9_]{2,24})\s+MISSION\s+COMPLETE")
 RE_GET_USER_NAME_FROM_TOP_5 = re.compile(r"\b([A-Z][A-Z0-9_]{2,24})\b.*?(\d{1,4}[.,]\d{2})\s*SEC")
 
-RE_TOP5_TIME_FOR_NAME = re.compile(r"\b([A-Z][A-Z0-9_]{2,24})\b\s+(\d{1,5}[.,]\d{2})\s*(?:SEC|초)?", re.IGNORECASE,)
+RE_TOP5_TIME_FOR_NAME = re.compile(
+    r"\b([A-Z][A-Z0-9_]{2,24})\b\s+(\d{1,5}[.,]\d{2})\s*(?:SEC|초)?",
+    re.IGNORECASE,
+)
+RE_TOP5_SECTION = re.compile(r"TOP\s*5", re.IGNORECASE)
+RE_TOP5_TIME_ANY = re.compile(r"(?<![0-9.,])(\d{1,5}[.,]\d{2})\s*(?:SEC|초)\b", re.IGNORECASE)
 RE_MAP_CODE_FULL = re.compile(r"MAP\s*(?:C(?:O|0)?DE)\s*[:\-]?\s*([A-Z0-9]{4,6})\b")
 RE_MAP_CODE_SHORT = re.compile(r"(?:C(?:O|0)?DE)\s*[:\-]?\s*([A-Z0-9]{4,6})\b")
 RE_MAP_CODE_CAPTURE = re.compile(r"\b([A-Z0-9]{4,6})\b")
 RE_MAP_CODE_FIND = re.compile(r"\b[A-Z0-9]{4,6}\b")
-RE_CODE_KEYWORD_EXTRACT = re.compile(r"(?:MAP\s+)?C(?:O|0)?DE\s*[:\-]?\s*([A-Z0-9]{4,6})\b", re.IGNORECASE,)
+RE_CODE_KEYWORD_EXTRACT = re.compile(
+    r"(?:MAP\s+)?C(?:O|0)?DE\s*[:\-]?\s*([A-Z0-9]{4,6})\b",
+    re.IGNORECASE,
+)
 RE_CODE_AFTER_COLON = re.compile(r":\s*([A-Z0-9]{4,6})\b", re.IGNORECASE,)
 
 RE_BASIC_NORMALIZATION = re.compile(r"[^A-Z0-9]")
@@ -531,7 +542,10 @@ _HAN = r"\u3400-\u4DBF\u4E00-\u9FFF"
 _LATIN = r"A-Za-z"
 
 _CJK_ALL = f"{_HANGUL}{_HIRAKATA}{_HAN}"
-
+RE_TOP5_TIME_FOR_NAME_CJK = re.compile(
+    rf"([{_CJK_ALL}]{{2,24}})\s+(\d{{1,5}}[.,]\d{{2}})\s*(?:SEC|초)?",
+    re.IGNORECASE,
+)
 # Generic ASCII words that should never be used as a player name
 _GENERIC_ASCII = {
     "MISSION",
@@ -707,6 +721,20 @@ def _normalize_name_for_compare(name: str) -> str:
     )
     return s
 
+_ROMAN_PREFIXES = ("VIII","VII","VI","IV","IX","V","III","II","I","X")
+
+def _name_variants_for_compare(name: str) -> set[str]:
+    s = _normalize_name_for_compare(name)
+    s = re.sub(r"[^A-Z0-9_]", "", s)
+    out = {s}
+
+    for p in _ROMAN_PREFIXES:
+        if s.startswith(p) and (len(s) - len(p)) >= 3:
+            out.add(s[len(p):])  # strip rank-like prefix (IVMOISTY -> MOISTY)
+            break
+
+    return {v for v in out if v}
+
 def select_best_name_candidate(candidates: list[OcrCandidate]) -> str | None:
     """Select the best candidate name among multiple OCR detections.
 
@@ -817,6 +845,7 @@ def ascii_name_from_banner_or_top_right(text_banner_en: str, text_top_right_en: 
 
     return None
 
+
 def preprocess_name_roi_for_cjk(image_bgr: np.ndarray) -> np.ndarray:
     """Upscale + slight sharpening for CJK name ROI to help OCR.
 
@@ -844,6 +873,7 @@ def preprocess_name_roi_for_cjk(image_bgr: np.ndarray) -> np.ndarray:
     sharp = cv2.addWeighted(up, 1.5, blur, -0.5, 0)
 
     return sharp
+
 
 def extract_name(  # noqa: PLR0913
     image_bottom_left: np.ndarray,
@@ -886,8 +916,8 @@ def extract_name(  # noqa: PLR0913
     ascii_bottom_left = ascii_name_from_bottom_left(text_bottom_left_en)
 
     # 2. CJK candidates (bottom-left + banner)
-    bl_cjk      = preprocess_name_roi_for_cjk(image_bottom_left)
-    bl_cjk_alt  = preprocess_name_roi_for_cjk(image_bottom_left_alt)
+    bl_cjk = preprocess_name_roi_for_cjk(image_bottom_left)
+    bl_cjk_alt = preprocess_name_roi_for_cjk(image_bottom_left_alt)
 
     candidates: list[OcrCandidate] = []
     for language_code in get_args(LanguageCode):
@@ -896,14 +926,14 @@ def extract_name(  # noqa: PLR0913
 
         if language_code in ("korean", "japan", "ch"):
             # Use enhanced crops for CJK
-            candidates += ocr_with_labels(bl_cjk,     language_code, "BL")
+            candidates += ocr_with_labels(bl_cjk, language_code, "BL")
             candidates += ocr_with_labels(bl_cjk_alt, language_code, "BL")
         else:
-            candidates += ocr_with_labels(image_bottom_left,     language_code, "BL")
+            candidates += ocr_with_labels(image_bottom_left, language_code, "BL")
             candidates += ocr_with_labels(image_bottom_left_alt, language_code, "BL")
 
-        candidates += ocr_with_labels(image_banner,        language_code, "BAN")
-        candidates += ocr_with_labels(image_banner_white,  language_code, "BAN")
+        candidates += ocr_with_labels(image_banner, language_code, "BAN")
+        candidates += ocr_with_labels(image_banner_white, language_code, "BAN")
         candidates += ocr_with_labels(image_banner_binary, language_code, "BAN")
 
     # 2.a. CJK candidate specifically in bottom-left HUD
@@ -941,7 +971,7 @@ def normalize_map_code(raw_code_text: str | None, require_digit: bool = True) ->
     - 4–6 alphanumeric characters
     - must contain at least one real digit BEFORE O→0 normalization
     - common HUD words and known non-codes are rejected
-    
+
     Args:
       raw_code_text: Raw OCR string representing a possible map code.
 
@@ -968,6 +998,7 @@ def normalize_map_code(raw_code_text: str | None, require_digit: bool = True) ->
         "MANTA",
         "KUMA",
         "WUHZI",
+        "MOISTY",
     }
 
     raw_up = (raw_code_text or "").upper()
@@ -1050,7 +1081,23 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
         token = m.group(0)
 
         # Skip obvious HUD words
-        if token in {"MADE", "BY", "TIME", "SEC", "SPLIT", "LEVEL", "TOP", "PLAYTEST", "CODE", "C0DE", "AUTO", "AUT0", "MANTA", "KUMA", "WUHZI"}:
+        if token in {
+            "MADE",
+            "BY",
+            "TIME",
+            "SEC",
+            "SPLIT",
+            "LEVEL",
+            "TOP",
+            "PLAYTEST",
+            "CODE",
+            "C0DE",
+            "AUTO",
+            "AUT0",
+            "MANTA",
+            "KUMA",
+            "WUHZI",
+        }:
             continue
 
         candidate = normalize_map_code(token, require_digit=True)
@@ -1105,6 +1152,7 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
         key=lambda kv: (kv[1], sum(c.isdigit() for c in kv[0])),
     )
     return best_code
+
 
 class ImageBase64Payload(BaseModel):
     """Pydantic model for a base64-encoded image payload.
@@ -1191,13 +1239,19 @@ def resolve_best_time_candidate(
     if not values:
         return None
 
-    scores: dict[float, float] = defaultdict(float)
+    # Prefer TOP5 by using the highest single-source weight as primary selector.
+    stats: dict[float, tuple[float, int, float]] = {}
     for v, w in zip(values, weights):
-        scores[v] += w
+        if v not in stats:
+            stats[v] = (w, 1, w)  # (max_weight, count, total_weight)
+        else:
+            max_w, cnt, tot = stats[v]
+            stats[v] = (max(max_w, w), cnt + 1, tot + w)
 
-    # Pick the value with the highest score.
-    # If scores are equal, prefer the larger time (usually more realistic).
-    best_value, _ = max(scores.items(), key=lambda kv: (kv[1], kv[0]))
+    # Pick the value with the highest max_weight.
+    # If equal, prefer the one supported by more sources, then by total weight,
+    # then prefer the larger time (usually more realistic).
+    best_value, _ = max(stats.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[1][2], kv[0]))
     return float(best_value)
 
 def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) -> float | None:
@@ -1213,31 +1267,105 @@ def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) ->
     if not text_top_right_en:
         return None
 
-    upper = text_top_right_en.upper()
-    matches = list(re.finditer(RE_TOP5_TIME_FOR_NAME, upper))
-    if not matches:
+    upper_full = (text_top_right_en or "").upper()
+
+    # Keep parsing inside TOP5 block (avoid unrelated HUD text)
+    m_top5 = re.search(RE_TOP5_SECTION, upper_full)
+    upper = upper_full[m_top5.start():] if m_top5 else upper_full
+
+    # Normalize "228 37" -> "228.37" inside this block to help regex
+    upper = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", upper)
+
+    def _to_float(s: str) -> float | None:
+        try:
+            return float((s or "").replace(",", "."))
+        except Exception:
+            return None
+
+    # Collect entries (pos, name, time_str)
+    entries: list[tuple[int, str, str]] = []
+
+    for m in re.finditer(RE_TOP5_TIME_FOR_NAME, upper):
+        entries.append((m.start(), m.group(1), m.group(2)))
+
+    for m in re.finditer(RE_TOP5_TIME_FOR_NAME_CJK, upper):
+        entries.append((m.start(), m.group(1), m.group(2)))
+
+    if not entries:
         return None
 
-    # If we know the player's name, only trust a TOP5 row that matches it
-    if name:
-        target_norm = _normalize_name_for_compare(name)
-        for m in matches:
-            cand_name = m.group(1)
-            cand_norm = _normalize_name_for_compare(cand_name)
-            if cand_norm == target_norm:
-                try:
-                    return float(m.group(2).replace(",", "."))
-                except Exception:
-                    return None
+    entries.sort(key=lambda x: x[0])
 
-        # No TOP5 row matched this player → do NOT fall back to another player
+    # Filter out obvious garbage "names" that your ASCII regex accepts (SEC, TOP, etc.)
+    BAD_TOP5_NAMES = set(_GENERIC_ASCII) | {"SEC", "TOP", "HOLD", "LEVEL", "PRACTICE", "RESTART", "LEADERBOARD"}
+    filtered: list[tuple[int, str, str]] = []
+    for pos, nm, ts in entries:
+        nm_u = (nm or "").upper()
+        if nm_u in BAD_TOP5_NAMES:
+            continue
+        if count_cjk_characters(nm) == 0 and nm_u in {"SEO", "SE0"}:
+            continue
+        if _to_float(ts) is None:
+            continue
+        filtered.append((pos, nm, ts))
+
+    # If we filtered everything (rare), fall back to raw entries
+    pool = filtered if filtered else entries
+
+    # If name unknown -> return first TOP5 time we can parse
+    if not name:
+        for _, _, ts in pool:
+            v = _to_float(ts)
+            if v is not None:
+                return v
         return None
 
-    # If name is unknown, we can still use the first TOP5 row as a generic fallback
-    try:
-        return float(matches[0].group(2).replace(",", "."))
-    except Exception:
-        return None
+    # If player name is CJK, match against CJK candidates first
+    if count_cjk_characters(name) >= 2:
+        target = remove_all_whitespace(name)
+        best: tuple[int, float] | None = None  # (pos, time)
+        for pos, cand_name, cand_time in pool:
+            if count_cjk_characters(cand_name) < 2:
+                continue
+            cand = remove_all_whitespace(cand_name)
+            if cand == target or (len(target) >= 3 and (target in cand or cand in target)):
+                v = _to_float(cand_time)
+                if v is None:
+                    continue
+                if best is None or pos < best[0]:
+                    best = (pos, v)
+        return best[1] if best else None
+
+    # ASCII matching (with roman-rank prefix variants like IVMOISTY -> MOISTY)
+    target_vars = _name_variants_for_compare(name)
+
+    best_choice: tuple[int, int, float] | None = None  # (score, pos, time)
+    for pos, cand_name, cand_time in pool:
+        if count_cjk_characters(cand_name) >= 2:
+            continue
+
+        cand_vars = _name_variants_for_compare(cand_name)
+
+        score = 0
+        if target_vars & cand_vars:
+            score = 3
+        else:
+            # relaxed contains/suffix match (IVMOISTY vs MOISTY)
+            if any((cv in tv or tv in cv) and min(len(cv), len(tv)) >= 4 for tv in target_vars for cv in cand_vars):
+                score = 2
+
+        if score <= 0:
+            continue
+
+        v = _to_float(cand_time)
+        if v is None:
+            continue
+
+        # Prefer higher score, then earliest occurrence in TOP5 block
+        if best_choice is None or (score > best_choice[0]) or (score == best_choice[0] and pos < best_choice[1]):
+            best_choice = (score, pos, v)
+
+    return best_choice[2] if best_choice else None
 
 @app.post("/extract", response_model=ApiResponse)
 async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiResponse:
@@ -1301,24 +1429,21 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
         + ocr_lines(banner_white_mask, "en")
         + ocr_lines(banner_binary, "en")
     )
-    text_top_right_en = join_lines(ocr_lines(top_right, "en"))
-    text_bottom_left_en = join_lines(ocr_lines(bottom_left, "en"))
-    text_top_left_en = join_lines(
-        ocr_lines(top_left, "en") + ocr_lines(top_left_wide, "en")
+    top_right_cjk = preprocess_name_roi_for_cjk(top_right)
+
+    text_top_right_en = join_lines(
+        ocr_lines(top_right, "en")
+        + ocr_lines(top_right_cjk, "korean")
+        + ocr_lines(top_right_cjk, "japan")
+        + ocr_lines(top_right_cjk, "ch")
     )
+    text_bottom_left_en = join_lines(ocr_lines(bottom_left, "en"))
+    text_top_left_en = join_lines(ocr_lines(top_left, "en") + ocr_lines(top_left_wide, "en"))
 
     top_left_white_mask = mask_white_regions(top_left_wide)
     top_left_cyan_mask = mask_cyan_regions(top_left_wide)
-    text_top_left_white_en = (
-        join_lines(ocr_lines(top_left_white_mask, "en"))
-        if top_left_white_mask is not None
-        else ""
-    )
-    text_top_left_cyan_en = (
-        join_lines(ocr_lines(top_left_cyan_mask, "en"))
-        if top_left_cyan_mask is not None
-        else ""
-    )
+    text_top_left_white_en = join_lines(ocr_lines(top_left_white_mask, "en")) if top_left_white_mask is not None else ""
+    text_top_left_cyan_en = join_lines(ocr_lines(top_left_cyan_mask, "en")) if top_left_cyan_mask is not None else ""
 
     # ----- CODE -----
     code = extract_code(
