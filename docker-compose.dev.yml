@@ -6,6 +6,10 @@ services:
     networks:
       - genji-network
     restart: unless-stopped
+    resources:
+        limits:
+          memory: 2.5gb
+
 
 networks:
   genji-network:
