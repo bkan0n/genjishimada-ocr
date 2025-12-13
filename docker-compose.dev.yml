@@ -6,6 +6,8 @@ services:
     networks:
       - genji-network
     restart: unless-stopped
+    mem_limit: 2.5g
+
 
 networks:
   genji-network:
