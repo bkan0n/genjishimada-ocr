@@ -29,9 +29,25 @@ from collections import defaultdict
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+# -----------------------------------------------------------------------------
+# OpenCV micro-optimizations: avoid creating/managing OpenCV threads
+# (often unnecessary for small OCR crops and can reduce overhead/memory).
+# -----------------------------------------------------------------------------
+try:
+    cv2.setNumThreads(0)
+except Exception:
+    pass
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("genjipk-ocr")
+
+# -----------------------------------------------------------------------------
+# Micro-optimizations: reusing certain OpenCV objects instead of recreating them
+# for each request.
+# -----------------------------------------------------------------------------
+_KERNEL_3 = np.ones((3, 3), np.uint8)
+_CLAHE = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
 
 RE_DIGITS_LOOSE_CLEANUP1 = re.compile(r"[^\d\.,]")
@@ -318,6 +334,30 @@ def decode_base64_image(image_b64: str) -> np.ndarray:
     return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
 
+def decode_image_bytes(image_bytes: bytes) -> np.ndarray:
+    """Decode raw image bytes into a BGR numpy array (OpenCV).
+
+    Micro-optimisation: Avoid the roundtrip bytes -> base64 str -> bytes -> PIL -> numpy,
+    which creates large temporary buffers and can cause RSS to bloat.
+
+    Args:
+      image_bytes: Raw image bytes (HTTP body).
+
+    Returns:
+      BGR image as numpy ndarray.
+
+    Raises:
+      HTTPException(400) if invalid img
+    """
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="invalid image stream: empty body")
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="invalid image stream: cv2.imdecode failed")
+    return img
+
+
 def crop_by_frac_roi(image: np.ndarray, roi_frac: list[float]) -> np.ndarray:
     """Crop an image using fractional ROI coordinates normalized to width/height.
 
@@ -352,7 +392,7 @@ def enhance_contrast_grayscale(image_bgr: np.ndarray) -> np.ndarray:
       A single-channel uint8 grayscale image after enhancement.
     """
     grayscale = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    grayscale = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(grayscale)
+    grayscale = _CLAHE.apply(grayscale)
     return cv2.GaussianBlur(grayscale, (3, 3), 0)
 
 
@@ -372,7 +412,7 @@ def mask_white_regions(image_bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([0, 0, 190], np.uint8), np.array([179, 60, 255], np.uint8))
     mask = cv2.medianBlur(mask, 3)
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 1)  # type: ignore
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _KERNEL_3, 1)  # type: ignore
 
 
 def mask_cyan_regions(image_bgr: np.ndarray) -> np.ndarray:
@@ -391,7 +431,7 @@ def mask_cyan_regions(image_bgr: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([80, 50, 120], np.uint8), np.array([105, 255, 255], np.uint8))
     mask = cv2.medianBlur(mask, 3)
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 1)  # type: ignore
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _KERNEL_3, 1)  # type: ignore
 
 
 def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str, float]]:
@@ -1395,12 +1435,11 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
         raise HTTPException(status_code=503, detail="OCR models not ready yet")
     try:
         session = request.app.state.http_session
-        resp = await session.get(str(payload.image_url))
-        if resp.status != 200:
-            raise HTTPException(status_code=400, detail=f"failed to fetch image: HTTP {resp.status}")
-        image_bytes = await resp.read()
-        image_b64 = base64.b64encode(image_bytes).decode()
-        img = decode_base64_image(image_b64)
+        async with session.get(str(payload.image_url)) as resp:
+            if resp.status != 200:
+                raise HTTPException(status_code=400, detail=f"failed to fetch image: HTTP {resp.status}")
+            image_bytes = await resp.read()
+        img = decode_image_bytes(image_bytes)
     except aiohttp.ClientError as e:
         raise HTTPException(status_code=400, detail=f"error fetching image: {e}")
     except Exception as e:
@@ -1424,21 +1463,27 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
         9,
     )
 
-    text_banner_en = join_lines(
-        ocr_lines(banner, "en")
-        + ocr_lines(banner_white_mask, "en")
-        + ocr_lines(banner_binary, "en")
-    )
+    _lines_banner = []
+    _lines_banner.extend(ocr_lines(banner, "en"))
+    _lines_banner.extend(ocr_lines(banner_white_mask, "en"))
+    _lines_banner.extend(ocr_lines(banner_binary, "en"))
+    text_banner_en = join_lines(_lines_banner)
+
     top_right_cjk = preprocess_name_roi_for_cjk(top_right)
 
-    text_top_right_en = join_lines(
-        ocr_lines(top_right, "en")
-        + ocr_lines(top_right_cjk, "korean")
-        + ocr_lines(top_right_cjk, "japan")
-        + ocr_lines(top_right_cjk, "ch")
-    )
+    _lines_top_right = []
+    _lines_top_right.extend(ocr_lines(top_right, "en"))
+    _lines_top_right.extend(ocr_lines(top_right_cjk, "korean"))
+    _lines_top_right.extend(ocr_lines(top_right_cjk, "japan"))
+    _lines_top_right.extend(ocr_lines(top_right_cjk, "ch"))
+    text_top_right_en = join_lines(_lines_top_right)
+
     text_bottom_left_en = join_lines(ocr_lines(bottom_left, "en"))
-    text_top_left_en = join_lines(ocr_lines(top_left, "en") + ocr_lines(top_left_wide, "en"))
+
+    _lines_top_left = []
+    _lines_top_left.extend(ocr_lines(top_left, "en"))
+    _lines_top_left.extend(ocr_lines(top_left_wide, "en"))
+    text_top_left_en = join_lines(_lines_top_left)
 
     top_left_white_mask = mask_white_regions(top_left_wide)
     top_left_cyan_mask = mask_cyan_regions(top_left_wide)
