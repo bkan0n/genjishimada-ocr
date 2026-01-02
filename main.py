@@ -824,6 +824,80 @@ def select_best_name_candidate(candidates: list[OcrCandidate]) -> str | None:
 
 
 # -------- ASCII helpers --------
+def _clean_ascii_hud_name(raw: str) -> str:
+    """Clean noisy ASCII name tokens from HUD OCR.
+
+    Common HUD noise patterns:
+      - Rank prefix stuck to the name: "IVMOISTY" / "1VMOISTY" / "IV1M0ISTY..."
+      - Trailing digit spam from the UI/glow: "...88888888"
+      - Leet-like OCR confusions inside letters: 0/O, 1/I, 5/S, 8/B, 2/Z
+
+    We keep digits by default (some real names contain digits),
+    and only apply de-leetspeak when the token looks polluted.
+    """
+    s = re.sub(r"[^A-Z0-9_]", "", (raw or "").upper()).strip("_")
+    if not s:
+        return s
+
+    # ---- Detect + remove trailing digit spam (UI/glow artifacts) ----
+    removed_trailing_spam = False
+
+    # Case A: same digit repeated 3+ times at the end (e.g. 8888888)
+    m_rep = re.search(r"(\d)\1{2,}$", s)
+    if m_rep:
+        prefix = s[: m_rep.start()]
+        # Only strip if prefix already looks like a "real" name
+        if len(prefix) >= 3 and sum(ch.isalpha() for ch in prefix) >= 2:
+            s = prefix
+            removed_trailing_spam = True
+
+    # Case B: long digit tail (6+ digits) at the end
+    m_tail = re.search(r"\d{6,}$", s)
+    if m_tail:
+        prefix = s[: m_tail.start()]
+        if len(prefix) >= 3 and sum(ch.isalpha() for ch in prefix) >= 2:
+            s = prefix
+            removed_trailing_spam = True
+
+    # If we removed spam, also strip repeated letter spam (rare, but can happen after OCR)
+    if removed_trailing_spam:
+        s2 = re.sub(r"([A-Z])\1{5,}$", "", s)
+        if s2:
+            s = s2
+
+    # ---- Decide if we should consider this token "polluted" ----
+    digit_count = sum(ch.isdigit() for ch in s)
+    # Heuristic: consider polluted if we removed trailing spam,
+    # OR if it's long-ish and digit-heavy (typical when rank badge sticks to it).
+    polluted = removed_trailing_spam or (len(s) >= 12 and digit_count >= 3)
+
+    # ---- Strip rank-like roman prefix only when polluted (avoid breaking legit names like IVAN) ----
+    if polluted:
+        # Allow OCR confusion: '1' often means 'I' in the rank badge.
+        s_for_prefix = s.replace("1", "I")
+
+        for p in _ROMAN_PREFIXES:
+            if s_for_prefix.startswith(p) and (len(s_for_prefix) - len(p)) >= 3:
+                s = s[len(p) :]
+                break
+
+        # De-leetspeak ONLY when polluted, and ONLY for digits that are likely OCR confusions.
+        # (We do NOT touch digits like 7, 9, etc.)
+        s = (
+            s.replace("0", "O")
+            .replace("1", "I")
+            .replace("5", "S")
+            .replace("8", "B")
+            .replace("2", "Z")
+        )
+
+        # If we still start with a single 'I' after stripping the rank, it's often leftover from the badge.
+        # Only drop it when the rest looks like a normal alpha name.
+        if s.startswith("I") and len(s) >= 5 and s[1:].isalpha():
+            s = s[1:]
+
+    return s
+
 def ascii_name_from_bottom_left(text: str) -> str | None:
     """Extract an ASCII player name from the bottom-left HUD text.
 
@@ -851,7 +925,18 @@ def ascii_name_from_bottom_left(text: str) -> str | None:
     if last in _GENERIC_ASCII:
         return None
 
-    return last
+    # Clean HUD noise (rank prefix, trailing spam digits, OCR leet confusions)
+    cleaned = _clean_ascii_hud_name(last)
+
+    # Re-validate after cleaning
+    if not cleaned:
+        return None
+    if cleaned in _GENERIC_ASCII:
+        return None
+    if not re.fullmatch(RE_ASCII_NAME_MATCH, cleaned):
+        return None
+
+    return cleaned
 
 
 def ascii_name_from_banner_or_top_right(text_banner_en: str, text_top_right_en: str) -> str | None:
@@ -1263,35 +1348,42 @@ def resolve_best_time_candidate(
       - top-left: 1.2 (main HUD time, usually stable)
       - TOP5: 1.5 (clean per-player entry when available)
     """
-    values: list[float] = []
-    weights: list[float] = []
+    candidates: list[tuple[float, float, str]] = []  # (value, weight, source)
 
-    for t, w in (
-        (banner_time, 1.0),
-        (top_left_time, 1.2),
-        (top5_time, 1.5),
+    for source, t, w in (
+        ("banner", banner_time, 1.0),
+        ("top_left", top_left_time, 1.2),
+        ("top5", top5_time, 1.5),
     ):
         if t is None or t <= 0:
             continue
-        values.append(round(t, 2))
-        weights.append(w)
+        candidates.append((round(float(t), 2), float(w), source))
 
-    if not values:
+    if not candidates:
         return None
 
     # Prefer TOP5 by using the highest single-source weight as primary selector.
-    stats: dict[float, tuple[float, int, float]] = {}
-    for v, w in zip(values, weights):
+    stats: dict[float, dict[str, object]] = {}
+    for v, w, src in candidates:
         if v not in stats:
-            stats[v] = (w, 1, w)  # (max_weight, count, total_weight)
+            stats[v] = {"count": 1, "total": w, "max": w, "sources": {src}}
         else:
-            max_w, cnt, tot = stats[v]
-            stats[v] = (max(max_w, w), cnt + 1, tot + w)
+            stats[v]["count"] = int(stats[v]["count"]) + 1
+            stats[v]["total"] = float(stats[v]["total"]) + w
+            stats[v]["max"] = max(float(stats[v]["max"]), w)
+            stats[v]["sources"].add(src)  # type: ignore[attr-defined]
 
     # Pick the value with the highest max_weight.
-    # If equal, prefer the one supported by more sources, then by total weight,
-    # then prefer the larger time (usually more realistic).
-    best_value, _ = max(stats.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[1][2], kv[0]))
+    # Prefer: more sources -> higher total weight -> higher max weight -> larger time
+    best_value, _ = max(
+        stats.items(),
+        key=lambda kv: (
+            int(kv[1]["count"]),
+            float(kv[1]["total"]),
+            float(kv[1]["max"]),
+            kv[0],
+        ),
+    )
     return float(best_value)
 
 def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) -> float | None:
@@ -1372,7 +1464,9 @@ def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) ->
                 v = _to_float(cand_time)
                 if v is None:
                     continue
-                if best is None or pos < best[0]:
+                # Prefer larger time if we have multiple matches (OCR can drop a leading digit),
+                # then earliest occurrence in TOP5 block
+                if best is None or v > best[1] + 1e-2 or (abs(v - best[1]) <= 1e-2 and pos < best[0]):
                     best = (pos, v)
         return best[1] if best else None
 
@@ -1401,8 +1495,15 @@ def extract_time_from_top5_for_name(text_top_right_en: str, name: str | None) ->
         if v is None:
             continue
 
-        # Prefer higher score, then earliest occurrence in TOP5 block
-        if best_choice is None or (score > best_choice[0]) or (score == best_choice[0] and pos < best_choice[1]):
+        # Prefer higher score, then larger time (OCR can drop a leading digit), then earliest occurrence in TOP5 block
+        if (
+            best_choice is None
+            or (score > best_choice[0])
+            or (
+                score == best_choice[0]
+                and (v > best_choice[2] + 1e-2 or (abs(v - best_choice[2]) <= 1e-2 and pos < best_choice[1]))
+            )
+        ):
             best_choice = (score, pos, v)
 
     return best_choice[2] if best_choice else None
