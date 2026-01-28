@@ -1,6 +1,6 @@
 # GenjiPK OCR (FastAPI + PaddleOCR)
 
-FastAPI microservice that extracts **player name**, **run time (seconds)**, and **map code** from Overwatch parkour screenshots using PaddleOCR (PP-OCRv3) with CPU-safe defaults.
+FastAPI microservice that extracts **player name**, **run time (seconds)**, and **map code** from Overwatch parkour screenshots using PaddleOCR 3.x (PP-OCRv5 mobile models) with CPU-safe defaults.
 Responses use **camelCase** via Pydantic aliases; internal code stays **snake_case**.
 
 ## Features
@@ -72,7 +72,7 @@ Open interactive docs at **`/docs`** and **`/redoc`**.
 ### Option A: Docker (recommended)
 
 ```bash
-# 1) Build (multi-stage pulls PP-OCRv3 weights)
+# 1) Build (multi-stage pulls PP-OCRv5 mobile weights)
 docker build -t genjishimada-ocr:latest .
 
 # 2) Run
@@ -84,7 +84,7 @@ curl http://localhost:8000/ping
 
 ### Option B: Local Python
 
-> Python 3.10; Linux is recommended for PaddlePaddle CPU wheels.
+> Python 3.11; Linux is recommended for PaddlePaddle CPU wheels.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -130,7 +130,7 @@ print(r.json())
    * White/cyan masks for high-salience overlays
    * Adaptive thresholding variant for the banner
 
-3. **OCR (PP-OCRv3)**
+3. **OCR (PP-OCRv5 mobile)**
    Engines are prewarmed per language and reused. `cls` is disabled for speed.
 
 4. **Parsing**
@@ -148,10 +148,9 @@ print(r.json())
 
 * **CPU flags** (already set):
   `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `FLAGS_use_mkldnn=0`
-  (Docker runtime uses `FLAGS_use_mkldnn=1` with AVX2 hints; OpenBLAS/OMP still capped.)
 * **Model cache path:** `/root/.paddleocr/whl` (prepopulated in Docker stage).
 * **Workers:** `--workers 4` is a good default; tune for your CPU.
-* **Memory:** PP-OCRv3 is modest on CPU; each worker loads its own models.
+* **Memory:** PP-OCRv5 mobile is modest on CPU; each worker loads its own models.
 
 ---
 
@@ -160,7 +159,7 @@ print(r.json())
 ```
 .
 ├─ main.py                 # FastAPI app, OCR logic, parsing heuristics
-├─ Dockerfile              # Multi-stage build with pre-fetched PP-OCRv3 models
+├─ Dockerfile              # Multi-stage build with pre-fetched PP-OCRv5 mobile models
 ├─ requirements.txt        # Runtime deps (pinned)
 ├─ pyproject.toml          # Packaging + Ruff config
 ├─ pyrightconfig.json      # Type checking (basic)
@@ -203,7 +202,7 @@ pyright
 
 ## Extending
 
-* Add new ROIs or languages: update the `SUPPORTED_LANGUAGES`, `_v3_dirs_for_language_code`, and Docker model fetch stage.
+* Add new ROIs or languages: update the `SUPPORTED_LANGUAGES`, `_model_dirs_for_language_code`, and Docker model fetch stage.
 * Add more HUD heuristics: create dedicated `extract_*` helpers and unit tests per heuristic.
 
 ---
@@ -216,5 +215,6 @@ MIT
 
 ## Acknowledgements
 
-* [PaddleOCR / PP-OCRv3](https://github.com/PaddlePaddle/PaddleOCR)
+* [PaddleOCR / PP-OCRv5](https://github.com/PaddlePaddle/PaddleOCR)
 * FastAPI / Pydantic / OpenCV / NumPy / Pillow
+
