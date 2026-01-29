@@ -34,7 +34,7 @@ os.environ["FLAGS_use_mkldnn"] = "0"
 # Limit per-request OCR time and variant count
 OCR_TIMEOUT_S = float(os.environ.get("OCR_TIMEOUT_S", "60"))
 FAST_OCR = os.environ.get("FAST_OCR", "1") == "1"
-MIN_NAME_LEN = int(os.environ.get("MIN_NAME_LEN", "4"))
+MIN_NAME_LEN = int(os.environ.get("MIN_NAME_LEN", "3"))
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -119,7 +119,6 @@ ROI_TOPLEFT_WIDE = [0.005, 0.010, 0.420, 0.340]
 ROI_BANNER_TIGHT = [0.240, 0.168, 0.760, 0.380]
 ROI_TOPRIGHT = [0.821, 0.077, 0.985, 0.565]
 ROI_BOTTOMLEFT = [0.050, 0.825, 0.330, 0.990]
-ROI_NAME_SPECIFIC = [0.050, 0.800, 0.400, 0.900]
 
 # TOP5 strip inside ROI_TOPRIGHT (to avoid "HOLD ... LEADERBOARD" junk)
 ROI_TR_TOP5_STRIP_1 = [0.22, 0.50, 1.00, 0.78]
@@ -1356,7 +1355,7 @@ def extract_name_from_bottom_left(
 
     Args:
       bl_name_roi: Tight name ROI.
-      bl_alt_roi: Alternate bottom-left ROI.
+      bl_alt_roi: Alternate bottom-left ROI (unused for name extraction).
 
     Returns:
       Extracted name or None.
@@ -1365,9 +1364,12 @@ def extract_name_from_bottom_left(
     if bl_name_roi is None or bl_name_roi.size == 0:
         return None
 
+    # Only use the tight name ROI to avoid HUD pollution.
+    name_rois = [bl_name_roi]
+
     # ---- ASCII candidates (English OCR) ----
     ascii_scores: dict[str, float] = {}
-    for roi in (bl_name_roi, bl_alt_roi):
+    for roi in name_rois:
         if roi is None or roi.size == 0:
             continue
         lines = ocr_lines(roi, "en")
@@ -1413,7 +1415,7 @@ def extract_name_from_bottom_left(
           None.
         """
         # Iterate over both ROI variants and preprocessing variants.
-        for roi in (bl_name_roi, bl_alt_roi):
+        for roi in name_rois:
             if roi is None or roi.size == 0:
                 continue
             for v in build_cjk_name_variants(roi):
@@ -2015,7 +2017,7 @@ def run_ocr_pipeline(img: np.ndarray) -> ApiResponse:
     banner = crop_by_frac_roi(img, ROI_BANNER_TIGHT)
     top_right = crop_by_frac_roi(img, ROI_TOPRIGHT)
     bottom_left = crop_by_frac_roi(img, ROI_BOTTOMLEFT)
-    bottom_left_name = crop_by_frac_roi(img, ROI_NAME_SPECIFIC)
+    bottom_left_name = crop_by_frac_roi(img, ROI_BOTTOMLEFT)
 
     # ---- TOP LEFT OCR (code + fallback time) ----
     tl_lines = []
