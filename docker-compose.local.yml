@@ -1,6 +1,11 @@
 services:
   genjishimada-ocr-dev:
     container_name: genjishimada-ocr-dev
+    environment:
+      OCR_MKLDNN: "1"
+      OCR_CPU_THREADS: "0"
+      OCR_MKLDNN_CACHE: "20"
+      DISABLE_MODEL_SOURCE_CHECK: "True"
     build:
       context: .
     ports:

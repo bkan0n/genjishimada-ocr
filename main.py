@@ -13,35 +13,76 @@ from time import perf_counter
 from pathlib import Path
 from typing import AsyncIterator, Literal, get_args
 
+# =============================================================================
+# Runtime / CPU safety
+# IMPORTANT: these env vars MUST be set before importing paddle/paddleocr.
+# =============================================================================
+
+def _available_cores() -> int:
+    # Respect container CPU limits / cpuset when possible
+    try:
+        if hasattr(os, "sched_getaffinity"):
+            return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        pass
+    return max(1, (os.cpu_count() or 1))
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+AVAILABLE_CORES = 1
+
+# MKLDNN is ON by default; disable with OCR_MKLDNN=0
+OCR_MKLDNN: bool = _env_bool("OCR_MKLDNN", default=True)
+
+# Threads: if OCR_CPU_THREADS is unset/0, auto-pick a safe default.
+try:
+    _t = int(os.environ.get("OCR_CPU_THREADS", "0") or "0")
+except Exception:
+    _t = 0
+OCR_CPU_THREADS: int = _t if _t > 0 else min(1, AVAILABLE_CORES)
+
+# Avoid thread oversubscription (OpenCV/OpenBLAS) and configure OMP/oneDNN threads.
+os.environ.setdefault("CPU_RUNTIME_CACHE_CAPACITY", "20")
+os.environ.setdefault("OPENBLAS_CORETYPE", "NEHALEM")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", str(OCR_CPU_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(OCR_CPU_THREADS))
+os.environ.setdefault("FLAGS_use_mkldnn", "1" if OCR_MKLDNN else "0")
+os.environ.setdefault("OMP_PROC_BIND", "TRUE")
+os.environ.setdefault("OMP_PLACES", "cores")
+
+# Optional workaround (only if you explicitly enable it):
+# Disable PIR API: set OCR_DISABLE_PIR=1 if you hit oneDNN/PIR regressions.
+if _env_bool("OCR_DISABLE_PIR", default=False):
+    os.environ.setdefault("FLAGS_enable_pir_api", "0")
+
 import aiohttp
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+from fastapi.responses import JSONResponse
 from paddleocr import PaddleOCR
 from PIL import Image, ImageFile
 from pydantic import BaseModel, ConfigDict, HttpUrl
 
-# =============================================================================
-# Runtime / CPU safety
-# =============================================================================
-os.environ.setdefault("CPU_RUNTIME_CACHE_CAPACITY", "20")
-os.environ.setdefault("OPENBLAS_CORETYPE", "NEHALEM")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ["FLAGS_use_mkldnn"] = "0"
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# OpenCV: avoid internal threading (we rely on OMP/oneDNN threads)
+cv2.setNumThreads(0)
+try:
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
 
 # Limit per-request OCR time and variant count
 OCR_TIMEOUT_S = float(os.environ.get("OCR_TIMEOUT_S", "60"))
 FAST_OCR = os.environ.get("FAST_OCR", "1") == "1"
 MIN_NAME_LEN = int(os.environ.get("MIN_NAME_LEN", "3"))
 
-ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-try:
-    cv2.setNumThreads(0)
-except Exception:
-    pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -254,7 +295,16 @@ _HANGUL_TENSE_MAP = {
 # PaddleOCR engine registry
 # =============================================================================
 OCR_ENGINES: dict[LanguageCode, PaddleOCR] = {}
+OCR_ENGINES_NO_MKLDNN: dict[LanguageCode, PaddleOCR] = {}
 SUPPORTED_LANGUAGES: tuple[LanguageCode, ...] = ("en", "ch", "korean", "japan")
+
+# Backwards-compat mapping used by older code paths
+LANG_MAP: dict[str, str] = {
+    "en": "en",
+    "ch": "ch",
+    "japan": "japan",
+    "korean": "korean",
+}
 
 
 def _pick_existing_dir(*candidates: Path) -> str | None:
@@ -318,7 +368,7 @@ def _model_dirs_for_language_code(
     return det_dir, rec_dir, ocr_version, det_name, rec_name
 
 
-def _build_ocr_engine(language_code: LanguageCode) -> PaddleOCR:
+def _build_ocr_engine(language_code: LanguageCode, *, enable_mkldnn: bool = OCR_MKLDNN, cpu_threads: int = OCR_CPU_THREADS) -> PaddleOCR:
     """Create and configure a PaddleOCR engine for the language.
 
     Args:
@@ -336,8 +386,9 @@ def _build_ocr_engine(language_code: LanguageCode) -> PaddleOCR:
         use_textline_orientation=False,
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
-        enable_mkldnn=False,
-        cpu_threads=1,
+        enable_mkldnn=enable_mkldnn,
+        cpu_threads=cpu_threads,
+        mkldnn_cache_capacity=int(os.environ.get('OCR_MKLDNN_CACHE','20')),
         text_recognition_batch_size=1,
         textline_orientation_batch_size=1,
         text_det_limit_side_len=960,
@@ -364,7 +415,7 @@ def warm_ocr_engines(languages: tuple[LanguageCode, ...] = SUPPORTED_LANGUAGES) 
     for lang in languages:
         if lang in OCR_ENGINES:
             continue
-        logger.info(f"📥 Warming PaddleOCR model: {lang} (MKLDNN OFF)")
+        logger.info(f"📥 Warming PaddleOCR model: {lang} (MKLDNN {'ON' if OCR_MKLDNN else 'OFF'}, threads={OCR_CPU_THREADS})")
         OCR_ENGINES[lang] = _build_ocr_engine(lang)
         logger.info(f"✅ Model ready: {lang}")
 
@@ -702,6 +753,15 @@ def build_cjk_name_variants(roi_bgr: np.ndarray) -> list[np.ndarray]:
 # =============================================================================
 # OCR wrapper
 # =============================================================================
+def _looks_like_onednn_pir_bug(err: Exception) -> bool:
+    s = str(err)
+    return (
+        "onednn_instruction" in s
+        or "ConvertPirAttribute2RuntimeAttribute" in s
+        or "pir::ArrayAttribute" in s
+        or "Unimplemented" in s
+    )
+
 def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str, float]]:
     """Run OCR on an image and return text/confidence lines.
 
@@ -723,8 +783,23 @@ def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str,
         else:
             result = engine.ocr(bgr) or []
     except Exception as e:
-        logger.warning(f"OCR({language_code}) failed: {e}")
-        return []
+        if OCR_MKLDNN and _looks_like_onednn_pir_bug(e):
+            logger.warning(f"OCR({language_code}) failed with oneDNN/PIR error under MKLDNN; retrying with MKLDNN OFF: {e}")
+            fb = OCR_ENGINES_NO_MKLDNN.get(language_code)
+            if fb is None:
+                fb = _build_ocr_engine(language_code, enable_mkldnn=False, cpu_threads=OCR_CPU_THREADS)
+                OCR_ENGINES_NO_MKLDNN[language_code] = fb
+            try:
+                if hasattr(fb, "predict"):
+                    result = fb.predict(bgr) or []
+                else:
+                    result = fb.ocr(bgr) or []
+            except Exception as e2:
+                logger.warning(f"OCR({language_code}) fallback (MKLDNN OFF) failed: {e2}")
+                return []
+        else:
+            logger.warning(f"OCR({language_code}) failed: {e}")
+            return []
 
     out: list[tuple[str, float]] = []
 
@@ -1459,6 +1534,10 @@ def extract_name_from_bottom_left(
         # Refine Hangul tense using only bottom-left evidence.
         evidence = [name for name, _ in cjk_candidates]
         return _pick_hangul_variant(picked_cjk, evidence)
+    if picked_ascii:
+        picked_ascii = _clean_ascii_token(picked_ascii)
+        picked_ascii = _strip_rank_prefix_ascii(picked_ascii)
+        picked_ascii = _clean_ascii_token(picked_ascii)
 
     return picked_ascii
 

@@ -28,10 +28,10 @@ RUN set -eux; \
 FROM python:3.11-slim
 WORKDIR /app
 
-ENV FLAGS_use_mkldnn=0 \
-    OMP_NUM_THREADS=1 \
-    OPENBLAS_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1 \
+ENV OCR_MKLDNN=1 \
+    OCR_CPU_THREADS=0 \
+    OCR_MKLDNN_CACHE=20 \
+    DISABLE_MODEL_SOURCE_CHECK=True \
     HOME=/root
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
