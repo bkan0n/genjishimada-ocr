@@ -7,6 +7,7 @@ import os
 import re
 import asyncio
 import unicodedata
+from dataclasses import dataclass
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from time import perf_counter
@@ -88,13 +89,35 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    force=True,
 )
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
 logger = logging.getLogger("genjipk-ocr")
+logger.setLevel(LOG_LEVEL)
+
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setLevel(LOG_LEVEL)
+    h.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s:%(name)s:%(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(h)
+
+logger.propagate = False
+
 
 _KERNEL_3 = np.ones((3, 3), np.uint8)
 _CLAHE = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
 PADDLE_WHL_DIR = Path.home() / ".paddleocr" / "whl"
+
+# -----------------------------------------------------------------------------
+# Request queue (serialize Paddle/oneDNN inference)
+# -----------------------------------------------------------------------------
+OCR_QUEUE_MAXSIZE = int(os.environ.get("OCR_QUEUE_MAXSIZE", "32"))  # 0 = unlimited
+OCR_QUEUE_WAIT_S = float(os.environ.get("OCR_QUEUE_WAIT_S", "180"))  # max wait in queue (sec)
 
 # =============================================================================
 # Types / Models
@@ -757,6 +780,9 @@ def _looks_like_onednn_pir_bug(err: Exception) -> bool:
     s = str(err)
     return (
         "onednn_instruction" in s
+        or "onednn_kernel" in s
+        or "Tensor holds no memory" in s
+        or "holder_ should not be null" in s
         or "ConvertPirAttribute2RuntimeAttribute" in s
         or "pir::ArrayAttribute" in s
         or "Unimplemented" in s
@@ -2202,6 +2228,71 @@ def run_ocr_pipeline(img: np.ndarray) -> ApiResponse:
 # =============================================================================
 # FastAPI
 # =============================================================================
+@dataclass
+class _OcrJob:
+    img: np.ndarray
+    url: str
+    fut: "asyncio.Future[ApiResponse]"
+    enqueued_at: float
+
+
+async def _ocr_worker(app: FastAPI) -> None:
+    """
+    Single FIFO worker that runs PaddleOCR inference sequentially.
+    This avoids oneDNN/MKLDNN concurrency crashes.
+    """
+    q: asyncio.Queue[_OcrJob] = app.state.ocr_queue
+
+    while True:
+        job = await q.get()
+        try:
+            # If the client disconnected / request cancelled, skip work
+            if job.fut.cancelled():
+                continue
+
+            wait_s = perf_counter() - job.enqueued_at
+            t0 = perf_counter()
+
+            # Run the heavy OCR pipeline in a thread (still sequential thanks to the queue)
+            res = await asyncio.wait_for(
+                asyncio.to_thread(run_ocr_pipeline, job.img),
+                timeout=OCR_TIMEOUT_S,
+            )
+
+            run_s = perf_counter() - t0
+            logger.info(f"[ocr] wait={wait_s:.2f}s run={run_s:.2f}s q={q.qsize()} url={job.url}")
+
+            if not job.fut.cancelled():
+                job.fut.set_result(res)
+
+        except asyncio.TimeoutError as e:
+            if not job.fut.cancelled():
+                job.fut.set_exception(e)
+        except Exception as e:
+            if not job.fut.cancelled():
+                job.fut.set_exception(e)
+        finally:
+            q.task_done()
+
+
+async def _enqueue_ocr(app: FastAPI, img: np.ndarray, url: str) -> ApiResponse:
+    q: asyncio.Queue[_OcrJob] = app.state.ocr_queue
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[ApiResponse] = loop.create_future()
+
+    # Optional backpressure
+    if OCR_QUEUE_MAXSIZE > 0 and q.full():
+        raise HTTPException(status_code=429, detail="OCR busy (queue full). Try again later.")
+
+    await q.put(_OcrJob(img=img, url=url, fut=fut, enqueued_at=perf_counter()))
+
+    try:
+        # Total wait = queue wait + execution time
+        return await asyncio.wait_for(fut, timeout=OCR_QUEUE_WAIT_S + OCR_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        fut.cancel()
+        raise
+
 class ImageURLPayload(BaseModel):
     image_url: HttpUrl
 
@@ -2222,7 +2313,20 @@ async def warm_models_on_startup(app: FastAPI) -> AsyncIterator:
     # Set a sane timeout to avoid hanging on slow or blocked URLs.
     timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=15)
     app.state.http_session = aiohttp.ClientSession(timeout=timeout)
+
+    # FIFO queue + single worker to serialize PaddleOCR calls
+    app.state.ocr_queue = asyncio.Queue(maxsize=OCR_QUEUE_MAXSIZE if OCR_QUEUE_MAXSIZE > 0 else 0)
+    app.state.ocr_worker_task = asyncio.create_task(_ocr_worker(app))
+
     yield
+
+    # Shutdown
+    app.state.ocr_worker_task.cancel()
+    try:
+        await app.state.ocr_worker_task
+    except asyncio.CancelledError:
+        pass
+
     await app.state.http_session.close()
 
 
@@ -2278,15 +2382,13 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
         raise HTTPException(status_code=500, detail=f"unexpected error: {e}")
 
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(run_ocr_pipeline, img),
-            timeout=OCR_TIMEOUT_S,
-        )
+        return await _enqueue_ocr(request.app, img, image_url)
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="ocr timeout")
+        raise HTTPException(status_code=504, detail="ocr timeout (queue + run)")
+
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=4)
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
