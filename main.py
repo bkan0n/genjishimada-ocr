@@ -1,25 +1,48 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
 import os
 import re
-import asyncio
 import unicodedata
-from dataclasses import dataclass
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from time import perf_counter
+from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Literal, get_args
+from time import perf_counter
+from typing import AsyncIterator, Literal
+
+import aiohttp
+import cv2
+import numpy as np
+from fastapi import FastAPI, HTTPException, Request
+from paddleocr import PaddleOCR
+from PIL import Image, ImageFile
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 # =============================================================================
 # Runtime / CPU safety
 # IMPORTANT: these env vars MUST be set before importing paddle/paddleocr.
 # =============================================================================
 
+
 def _available_cores() -> int:
+    """
+    Compute the number of CPU cores available to this process.
+
+    Purpose:
+      - Respect container CPU limits and cpuset/affinity when available.
+      - Provide a safe fallback for environments where affinity is unavailable.
+
+    Returns:
+      - An integer >= 1 representing the usable CPU core count.
+
+    Notes:
+      - Prefers `os.sched_getaffinity(0)` (Linux) because it reflects cgroup/cpuset limits.
+      - Falls back to `os.cpu_count()` if affinity is not supported or fails.
+    """
     # Respect container CPU limits / cpuset when possible
     try:
         if hasattr(os, "sched_getaffinity"):
@@ -28,13 +51,35 @@ def _available_cores() -> int:
         pass
     return max(1, (os.cpu_count() or 1))
 
+
 def _env_bool(name: str, default: bool = False) -> bool:
+    """
+    Read a boolean-like environment variable.
+
+    Purpose:
+      - Convert common truthy strings into a Python boolean.
+      - Provide a consistent toggle mechanism for runtime flags.
+
+    Args:
+      name:
+        - Environment variable name to read.
+      default:
+        - Value returned if the variable is not set.
+
+    Returns:
+      - True if the env value is one of: "1", "true", "yes", "on" (case-insensitive).
+      - Otherwise False, or `default` if not set.
+
+    Notes:
+      - Whitespace is stripped before comparison.
+    """
     v = os.environ.get(name)
     if v is None:
         return default
     return v.strip().lower() in ("1", "true", "yes", "on")
 
-AVAILABLE_CORES = 1
+
+AVAILABLE_CORES = _available_cores()
 
 # MKLDNN is ON by default; disable with OCR_MKLDNN=0
 OCR_MKLDNN: bool = _env_bool("OCR_MKLDNN", default=True)
@@ -44,7 +89,19 @@ try:
     _t = int(os.environ.get("OCR_CPU_THREADS", "0") or "0")
 except Exception:
     _t = 0
-OCR_CPU_THREADS: int = _t if _t > 0 else min(1, AVAILABLE_CORES)
+
+# Auto: use up to 4 threads (or less if CPU-limited)
+OCR_CPU_THREADS: int = _t if _t > 0 else max(1, min(4, AVAILABLE_CORES))
+
+# Perf/behavior toggles
+OCR_EARLY_EXIT = _env_bool("OCR_EARLY_EXIT", default=True)  # stop once we have everything
+OCR_DEBUG_TEXTS = _env_bool("OCR_DEBUG_TEXTS", default=False)  # expensive debug OCR strings
+ACCURATE_OCR = _env_bool("ACCURATE_OCR", default=False)  # if True, run banner/top5 even if TL time found
+OCR_TRUST_HINTS = _env_bool("OCR_TRUST_HINTS", default=False)  # allow using hints as fallback if OCR fails
+
+# Hint matching: prefer provided hint only when it matches OCR at this threshold.
+HINT_MATCH_THRESHOLD = float(os.environ.get("HINT_MATCH_THRESHOLD", "0.90"))
+HINT_TIME_ABS_TOL = float(os.environ.get("HINT_TIME_ABS_TOL", "0"))
 
 # Avoid thread oversubscription (OpenCV/OpenBLAS) and configure OMP/oneDNN threads.
 os.environ.setdefault("CPU_RUNTIME_CACHE_CAPACITY", "20")
@@ -61,15 +118,6 @@ os.environ.setdefault("OMP_PLACES", "cores")
 if _env_bool("OCR_DISABLE_PIR", default=False):
     os.environ.setdefault("FLAGS_enable_pir_api", "0")
 
-import aiohttp
-import cv2
-import numpy as np
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
-from fastapi.responses import JSONResponse
-from paddleocr import PaddleOCR
-from PIL import Image, ImageFile
-from pydantic import BaseModel, ConfigDict, HttpUrl
-
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # OpenCV: avoid internal threading (we rely on OMP/oneDNN threads)
@@ -83,7 +131,6 @@ except Exception:
 OCR_TIMEOUT_S = float(os.environ.get("OCR_TIMEOUT_S", "60"))
 FAST_OCR = os.environ.get("FAST_OCR", "1") == "1"
 MIN_NAME_LEN = int(os.environ.get("MIN_NAME_LEN", "3"))
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -99,14 +146,15 @@ logger.setLevel(LOG_LEVEL)
 if not logger.handlers:
     h = logging.StreamHandler()
     h.setLevel(LOG_LEVEL)
-    h.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)s:%(name)s:%(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+    h.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s:%(name)s:%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
     logger.addHandler(h)
 
 logger.propagate = False
-
 
 _KERNEL_3 = np.ones((3, 3), np.uint8)
 _CLAHE = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -127,13 +175,23 @@ RoiLabel = Literal["BL", "BAN", "TR", "TL"]
 
 
 def to_camel(s: str) -> str:
-    """Convert snake_case identifiers to camelCase.
+    """
+    Convert a snake_case identifier to camelCase.
+
+    Purpose:
+      - Provide a consistent JSON/API naming convention (camelCase) while keeping Python fields snake_case.
+      - Used by Pydantic's alias generator for request/response models.
 
     Args:
-      s: Input string in snake_case.
+      s:
+        - Input string in snake_case (e.g., "top_left_white").
 
     Returns:
-      The camelCase version of the string.
+      - camelCase string (e.g., "topLeftWhite").
+
+    Notes:
+      - The first segment is kept lowercase; subsequent segments are title-cased.
+      - Does not attempt to handle acronyms specially; it is a simple transformation.
     """
     # Split into words and keep the first segment lowercase.
     parts = s.split("_")
@@ -189,6 +247,7 @@ ROI_TOPRIGHT = [0.821, 0.077, 0.985, 0.565]
 ROI_BOTTOMLEFT = [0.050, 0.825, 0.330, 0.990]
 
 # TOP5 strip inside ROI_TOPRIGHT (to avoid "HOLD ... LEADERBOARD" junk)
+ROI_TR_TOP5_STRIP_0 = [0.02, 0.18, 1.00, 0.62]
 ROI_TR_TOP5_STRIP_1 = [0.22, 0.50, 1.00, 0.78]
 ROI_TR_TOP5_STRIP_2 = [0.16, 0.48, 1.00, 0.82]
 
@@ -331,13 +390,23 @@ LANG_MAP: dict[str, str] = {
 
 
 def _pick_existing_dir(*candidates: Path) -> str | None:
-    """Return the first existing path among the candidates.
+    """
+    Pick the first existing directory from a list of candidates.
+
+    Purpose:
+      - Resolve PaddleOCR model directories across multiple possible locations.
+      - Keep priority order deterministic.
 
     Args:
-      candidates: Paths to check in priority order.
+      *candidates:
+        - One or more Path objects, checked in the order given.
 
     Returns:
-      The first existing path as a string, or None.
+      - The first existing path as a string, or None if none exist.
+
+    Notes:
+      - Uses `Path.exists()` (works for both files and directories, but candidates are expected to be dirs).
+      - Priority is preserved by iterating in-order.
     """
     # Preserve priority by checking in order.
     for cand in candidates:
@@ -349,17 +418,27 @@ def _pick_existing_dir(*candidates: Path) -> str | None:
 def _model_dirs_for_language_code(
     language_code: LanguageCode,
 ) -> tuple[str | None, str | None, str, str | None, str | None]:
-    """Resolve model directories and model names for a given language.
+    """
+    Resolve detection/recognition model directories and names for a language.
 
-    Rules:
-    - use PP-OCRv5 mobile models for minimum size
-    - keep per-language recognition models when available
+    Purpose:
+      - Centralize model path selection per language.
+      - Prefer PP-OCRv5 "mobile" models to reduce size and cold-start costs.
 
     Args:
-      language_code: Language identifier.
+      language_code:
+        - One of the supported PaddleOCR language identifiers.
 
     Returns:
-      Tuple of (det_dir, rec_dir, ocr_version, det_name, rec_name).
+      - (det_dir, rec_dir, ocr_version, det_name, rec_name)
+        - det_dir / rec_dir: filesystem paths as strings (or None if missing)
+        - ocr_version: OCR version string passed to PaddleOCR
+        - det_name / rec_name: model name identifiers (or None if missing)
+
+    Notes:
+      - English and Korean use per-language recognition models when available.
+      - Chinese and Japanese use the shared mobile recognition model if present.
+      - Logs a single summary line per language to aid debugging container mounts.
     """
     normalized_language = language_code.lower()
     ocr_version = "PP-OCRv5"
@@ -391,14 +470,34 @@ def _model_dirs_for_language_code(
     return det_dir, rec_dir, ocr_version, det_name, rec_name
 
 
-def _build_ocr_engine(language_code: LanguageCode, *, enable_mkldnn: bool = OCR_MKLDNN, cpu_threads: int = OCR_CPU_THREADS) -> PaddleOCR:
-    """Create and configure a PaddleOCR engine for the language.
+def _build_ocr_engine(
+    language_code: LanguageCode,
+    *,
+    enable_mkldnn: bool = OCR_MKLDNN,
+    cpu_threads: int = OCR_CPU_THREADS,
+) -> PaddleOCR:
+    """
+    Construct a PaddleOCR engine configured for this service.
+
+    Purpose:
+      - Create a CPU-only PaddleOCR instance with consistent thresholds and model paths.
+      - Support toggling MKLDNN and CPU thread count for stability/performance.
 
     Args:
-      language_code: Language identifier.
+      language_code:
+        - PaddleOCR language code used for recognition.
+      enable_mkldnn:
+        - Whether to enable oneDNN/MKLDNN acceleration (may be unstable on some CPUs/builds).
+      cpu_threads:
+        - Thread count passed to PaddleOCR inference engine.
 
     Returns:
-      Configured PaddleOCR engine.
+      - A configured `PaddleOCR` instance.
+
+    Notes:
+      - Model directories are resolved before instantiation; missing dirs may still allow fallback behavior
+        depending on PaddleOCR internals, but this service expects models to be present.
+      - Detection/recognition thresholds are tuned for HUD text (small/low-contrast) rather than documents.
     """
     # Resolve model directories before instantiation.
     det_dir, rec_dir, ocr_version, det_name, rec_name = _model_dirs_for_language_code(language_code)
@@ -411,7 +510,7 @@ def _build_ocr_engine(language_code: LanguageCode, *, enable_mkldnn: bool = OCR_
         use_doc_unwarping=False,
         enable_mkldnn=enable_mkldnn,
         cpu_threads=cpu_threads,
-        mkldnn_cache_capacity=int(os.environ.get('OCR_MKLDNN_CACHE','20')),
+        mkldnn_cache_capacity=int(os.environ.get("OCR_MKLDNN_CACHE", "20")),
         text_recognition_batch_size=1,
         textline_orientation_batch_size=1,
         text_det_limit_side_len=960,
@@ -426,13 +525,23 @@ def _build_ocr_engine(language_code: LanguageCode, *, enable_mkldnn: bool = OCR_
 
 
 def warm_ocr_engines(languages: tuple[LanguageCode, ...] = SUPPORTED_LANGUAGES) -> None:
-    """Warm OCR engines so requests do not pay model load costs.
+    """
+    Preload PaddleOCR models into memory.
+
+    Purpose:
+      - Avoid cold-start latency on the first request.
+      - Ensure model initialization failures appear at startup rather than mid-request.
 
     Args:
-      languages: Languages to warm.
+      languages:
+        - Languages to load and register in `OCR_ENGINES`.
 
     Returns:
-      None.
+      - None.
+
+    Notes:
+      - Idempotent: skips languages already present in `OCR_ENGINES`.
+      - Uses the global MKLDNN/thread settings at load time.
     """
     # Avoid reloading models that are already initialized.
     for lang in languages:
@@ -444,13 +553,25 @@ def warm_ocr_engines(languages: tuple[LanguageCode, ...] = SUPPORTED_LANGUAGES) 
 
 
 def get_ocr_engine(language_code: LanguageCode) -> PaddleOCR:
-    """Return a warmed OCR engine or raise if unavailable.
+    """
+    Retrieve a warmed PaddleOCR engine for a given language.
+
+    Purpose:
+      - Provide a single access point for OCR engines.
+      - Fail fast with an HTTP-friendly error if models are not ready.
 
     Args:
-      language_code: Language identifier.
+      language_code:
+        - Requested language engine key.
 
     Returns:
-      Warmed PaddleOCR engine.
+      - The warmed `PaddleOCR` instance.
+
+    Raises:
+      - HTTPException(503) if the engine is not loaded.
+
+    Notes:
+      - Call `warm_ocr_engines()` during startup to populate the registry.
     """
     # Fail fast if models are not ready yet.
     engine = OCR_ENGINES.get(language_code)
@@ -460,39 +581,47 @@ def get_ocr_engine(language_code: LanguageCode) -> PaddleOCR:
 
 
 def log_model_dirs() -> None:
-    """Log resolved model directories for debugging.
+    """
+    Log resolved model directories for each supported language.
 
-    Args:
-      None.
+    Purpose:
+      - Make model resolution visible in container logs.
+      - Simplify debugging when model files are missing or mounted incorrectly.
 
     Returns:
-      None.
+      - None.
+
+    Notes:
+      - Calls `_model_dirs_for_language_code()` for a fixed set of languages.
+      - Intended to run at startup.
     """
     # Emit per-language model paths for troubleshooting.
     for lang in ("en", "korean", "japan", "ch"):
         det_dir, rec_dir, ocr_version, det_name, rec_name = _model_dirs_for_language_code(lang)  # type: ignore[arg-type]
-        logger.info(
-            f"[models] {lang}: ocr={ocr_version} det={det_dir} rec={rec_dir} "
-            f"det_name={det_name} rec_name={rec_name}"
-        )
+        logger.info(f"[models] {lang}: ocr={ocr_version} det={det_dir} rec={rec_dir} det_name={det_name} rec_name={rec_name}")
 
 
 # =============================================================================
 # Core image utilities
 # =============================================================================
 def normalize_base64_padding(b64_string: str) -> str:
-    """Normalize and pad a base64 string.
+    """
+    Normalize a base64 string and ensure proper '=' padding.
 
-    Rules:
-    - normalize URL-safe characters
-    - remove whitespace
-    - pad to a multiple of four
+    Purpose:
+      - Accept base64 from multiple sources (URL-safe variants, whitespace, missing padding).
+      - Produce a decodable base64 payload for downstream decoding.
 
     Args:
-      b64_string: Raw base64 string.
+      b64_string:
+        - Raw base64 content (may contain whitespace or URL-safe characters).
 
     Returns:
-      Padded base64 string.
+      - A cleaned base64 string padded to a multiple-of-4 length.
+
+    Notes:
+      - Converts '-' -> '+', '_' -> '/'.
+      - Removes whitespace and normalizes spaces to '+' (common form encoding).
     """
     # Normalize whitespace and URL-safe characters first.
     cleaned = re.sub(RE_SPACES, "", b64_string).replace("-", "+").replace("_", "/").replace(" ", "+")
@@ -501,13 +630,26 @@ def normalize_base64_padding(b64_string: str) -> str:
 
 
 def decode_base64_image(image_b64: str) -> np.ndarray:
-    """Decode a base64 data URL into a BGR OpenCV image.
+    """
+    Decode a base64 image (optionally a data URL) into an OpenCV BGR image.
+
+    Purpose:
+      - Support API clients that upload images as base64 strings.
+      - Convert PIL image bytes into an OpenCV-compatible ndarray.
 
     Args:
-      image_b64: Base64 string or data URL.
+      image_b64:
+        - Base64 string or full data URL (e.g. "data:image/png;base64,...").
 
     Returns:
-      OpenCV BGR image.
+      - OpenCV image in BGR color space (np.ndarray).
+
+    Raises:
+      - HTTPException(400) for missing/invalid base64 or invalid image streams.
+
+    Notes:
+      - Uses PIL for robust decoding of various formats, then converts RGB->BGR.
+      - `validate=False` is used to be tolerant of minor base64 irregularities.
     """
     # Validate and strip data URL header if present.
     if not image_b64:
@@ -520,7 +662,6 @@ def decode_base64_image(image_b64: str) -> np.ndarray:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"invalid base64: {e}")
     try:
-        # Load with Pillow to support more formats.
         pil_image = Image.open(io.BytesIO(image_bytes))
         pil_image.load()
         pil_image = pil_image.convert("RGB")
@@ -530,13 +671,24 @@ def decode_base64_image(image_b64: str) -> np.ndarray:
 
 
 def decode_image_bytes(image_bytes: bytes) -> np.ndarray:
-    """Decode raw image bytes into a BGR OpenCV image.
+    """
+    Decode raw image bytes into an OpenCV BGR image.
+
+    Purpose:
+      - Decode fetched image content (HTTP response bytes) quickly via OpenCV.
 
     Args:
-      image_bytes: Raw image bytes.
+      image_bytes:
+        - Raw bytes representing an encoded image (PNG/JPG/WebP, etc.).
 
     Returns:
-      OpenCV BGR image.
+      - OpenCV image in BGR color space (np.ndarray).
+
+    Raises:
+      - HTTPException(400) if bytes are empty or cannot be decoded.
+
+    Notes:
+      - OpenCV is faster than PIL here but less forgiving on malformed streams.
     """
     # OpenCV decoding is faster but expects valid image bytes.
     if not image_bytes:
@@ -549,14 +701,25 @@ def decode_image_bytes(image_bytes: bytes) -> np.ndarray:
 
 
 def crop_by_frac_roi(image: np.ndarray, roi_frac: list[float]) -> np.ndarray:
-    """Crop an image by fractional ROI coordinates.
+    """
+    Crop an image using fractional ROI coordinates.
+
+    Purpose:
+      - Define ROIs in a resolution-independent way (fractions of width/height).
+      - Extract HUD blocks reliably across different screenshot sizes.
 
     Args:
-      image: Source image.
-      roi_frac: Fractional ROI [x1, y1, x2, y2].
+      image:
+        - Source image (BGR or grayscale).
+      roi_frac:
+        - Fractional ROI as [x1, y1, x2, y2] in range 0..1.
 
     Returns:
-      Cropped image.
+      - A copied crop (np.ndarray) of the ROI region.
+
+    Notes:
+      - Coordinates are clamped to image bounds.
+      - Returns a `.copy()` to avoid referencing the original buffer.
     """
     # Convert fractional ROI to pixel coordinates.
     h, w = image.shape[:2]
@@ -568,14 +731,24 @@ def crop_by_frac_roi(image: np.ndarray, roi_frac: list[float]) -> np.ndarray:
 
 
 def crop_within(parent_crop: np.ndarray, rel_roi: list[float]) -> np.ndarray:
-    """Crop a sub-ROI within an already cropped image.
+    """
+    Crop a sub-ROI inside an already-cropped image.
+
+    Purpose:
+      - Allow nested ROI definitions (e.g., TOP5 strip inside TOPRIGHT ROI).
+      - Keep ROI definitions clean and composable.
 
     Args:
-      parent_crop: Parent crop image.
-      rel_roi: Fractional ROI relative to the parent crop.
+      parent_crop:
+        - Image that represents the parent ROI.
+      rel_roi:
+        - Fractional ROI relative to `parent_crop` coordinates.
 
     Returns:
-      Cropped image.
+      - Cropped sub-image (np.ndarray).
+
+    Notes:
+      - Thin wrapper around `crop_by_frac_roi()` for readability.
     """
     # Delegate to the generic fractional cropper.
     return crop_by_frac_roi(parent_crop, rel_roi)
@@ -585,30 +758,47 @@ def crop_within(parent_crop: np.ndarray, rel_roi: list[float]) -> np.ndarray:
 # Pre-processing
 # =============================================================================
 def enhance_contrast_grayscale(image_bgr: np.ndarray) -> np.ndarray:
-    """Convert to grayscale and enhance local contrast.
+    """
+    Convert BGR -> grayscale and enhance local contrast for OCR.
+
+    Purpose:
+      - Improve text readability in low-contrast HUD regions.
+      - Reduce noise while preserving edges.
 
     Args:
-      image_bgr: Input BGR image.
+      image_bgr:
+        - Input BGR image.
 
     Returns:
-      Enhanced grayscale image.
+      - Preprocessed grayscale image (np.ndarray).
+
+    Notes:
+      - Applies CLAHE (adaptive histogram equalization) + mild Gaussian blur.
     """
-    # CLAHE improves local contrast before thresholding.
     g = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     g = _CLAHE.apply(g)
     return cv2.GaussianBlur(g, (3, 3), 0)
 
 
 def mask_white_regions(image_bgr: np.ndarray) -> np.ndarray:
-    """Create a mask for bright white HUD elements.
+    """
+    Build a binary mask for bright white HUD text/elements.
+
+    Purpose:
+      - Isolate white text which often OCRs better on a binary mask.
+      - Reduce background clutter in HUD regions.
 
     Args:
-      image_bgr: Input BGR image.
+      image_bgr:
+        - Input BGR image.
 
     Returns:
-      Binary mask image.
+      - Single-channel mask image (uint8, 0 or 255).
+
+    Notes:
+      - Uses HSV thresholding tuned for bright/low-saturation whites.
+      - Applies median blur + morphological close to fill small gaps.
     """
-    # HSV thresholding isolates near-white text.
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([0, 0, 190], np.uint8), np.array([179, 70, 255], np.uint8))
     mask = cv2.medianBlur(mask, 3)
@@ -616,110 +806,139 @@ def mask_white_regions(image_bgr: np.ndarray) -> np.ndarray:
 
 
 def mask_cyan_regions(image_bgr: np.ndarray) -> np.ndarray:
-    """Create a mask for saturated cyan UI accents.
+    """
+    Build a binary mask for saturated cyan UI accents.
+
+    Purpose:
+      - Extract cyan-colored HUD text/edges which appear in some themes.
+      - Provide an alternate OCR input when white masks fail.
 
     Args:
-      image_bgr: Input BGR image.
+      image_bgr:
+        - Input BGR image.
 
     Returns:
-      Binary mask image.
+      - Single-channel mask image (uint8, 0 or 255).
+
+    Notes:
+      - HSV bounds are tuned for saturated cyan (not pale HUD cyan).
     """
-    # Hue range covers bright cyan overlays.
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(
-        hsv,
-        np.array([85, 35, 70], np.uint8),
-        np.array([130, 255, 255], np.uint8),
-    )
+    mask = cv2.inRange(hsv, np.array([85, 35, 70], np.uint8), np.array([130, 255, 255], np.uint8))
     mask = cv2.medianBlur(mask, 3)
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _KERNEL_3, 1)  # type: ignore
 
 
 def mask_hud_cyan_regions(image_bgr: np.ndarray) -> np.ndarray:
-    """Create a mask for pale cyan HUD text.
+    """
+    Build a binary mask for pale cyan HUD text.
+
+    Purpose:
+      - Target lighter cyan shades commonly used in Overwatch HUD typography.
+      - Improve OCR on names/times rendered in cyan.
 
     Args:
-      image_bgr: Input BGR image.
+      image_bgr:
+        - Input BGR image.
 
     Returns:
-      Binary mask image.
+      - Single-channel mask image (uint8, 0 or 255).
+
+    Notes:
+      - HSV bounds are wider and allow lower saturation than `mask_cyan_regions()`.
     """
-    # HUD name text is often pale cyan with low saturation; use a softer S cutoff.
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(
-        hsv,
-        np.array([80, 10, 110], np.uint8),
-        np.array([135, 255, 255], np.uint8),
-    )
+    mask = cv2.inRange(hsv, np.array([80, 10, 110], np.uint8), np.array([135, 255, 255], np.uint8))
     mask = cv2.medianBlur(mask, 3)
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _KERNEL_3, 1)  # type: ignore
 
 
 def unsharp(image_bgr: np.ndarray, amount: float = 1.6, sigma: float = 1.0) -> np.ndarray:
-    """Apply a simple unsharp mask for edge emphasis.
+    """
+    Apply an unsharp mask to emphasize edges.
+
+    Purpose:
+      - Sharpen HUD text strokes that are slightly blurred by compression.
+      - Help OCR detect character boundaries.
 
     Args:
-      image_bgr: Input BGR image.
-      amount: Sharpening amount.
-      sigma: Blur sigma for the mask.
+      image_bgr:
+        - Input image (typically BGR).
+      amount:
+        - Sharpening strength (higher = more edge emphasis).
+      sigma:
+        - Gaussian blur sigma used to create the "unsharp" component.
 
     Returns:
-      Sharpened image.
+      - Sharpened image (np.ndarray).
+
+    Notes:
+      - Uses linear blending of original and blurred image.
     """
-    # Sharpen by subtracting a blurred version.
     blur = cv2.GaussianBlur(image_bgr, (0, 0), sigma)
     return cv2.addWeighted(image_bgr, amount, blur, -(amount - 1.0), 0)
 
 
 def upscale(image_bgr: np.ndarray, scale: float) -> np.ndarray:
-    """Upscale an image with cubic interpolation.
+    """
+    Upscale an image using cubic interpolation.
+
+    Purpose:
+      - Increase effective character size for OCR on small ROIs.
+      - Improve recognition on small fonts without changing aspect ratio.
 
     Args:
-      image_bgr: Input BGR image.
-      scale: Upscale factor.
+      image_bgr:
+        - Input image.
+      scale:
+        - Scale factor (e.g., 2.0, 2.8).
 
     Returns:
-      Upscaled image.
+      - Upscaled image.
+
+    Notes:
+      - Uses INTER_CUBIC for smoother edges.
     """
-    # Cubic interpolation preserves edges for OCR.
     return cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
 
 def build_cjk_variants(roi_bgr: np.ndarray) -> list[np.ndarray]:
-    """Generate multiple preprocessing variants for CJK OCR.
+    """
+    Build a small set of preprocessing variants for CJK OCR.
 
-    Rules:
-    - when FAST_OCR is enabled, return a smaller variant set
+    Purpose:
+      - Provide multiple "views" of the same ROI to increase OCR robustness.
+      - Include masks and contrast-enhanced variants that help on different HUD styles.
 
     Args:
-      roi_bgr: ROI image in BGR.
+      roi_bgr:
+        - ROI image in BGR.
 
     Returns:
-      List of variant images.
+      - A list of images (BGR or single-channel masks) to feed into OCR.
+
+    Notes:
+      - Returns an empty list on empty ROI.
+      - In FAST_OCR mode, the variant list is intentionally small to reduce CPU load.
+      - Variants include: base, upscaled+unsharp, white mask, cyan mask, grayscale, etc.
     """
-    # Return early for empty inputs.
     if roi_bgr is None or roi_bgr.size == 0:
         return []
 
     variants: list[np.ndarray] = []
     base = roi_bgr
-
-    # Baseline variant.
     variants.append(base)
 
     h, w = base.shape[:2]
     scale = 2.8 if min(h, w) < 160 else 2.0
     up = upscale(base, scale)
     up = unsharp(up, amount=1.7, sigma=1.0)
-    # Upscale + sharpen helps distinguish tight strokes.
     variants.append(up)
 
     wmask = mask_white_regions(base)
-    # White masks capture bright overlay text.
     variants.append(wmask)
 
     cmask = mask_cyan_regions(base)
-    # Cyan masks capture UI text in blue hues.
     variants.append(cmask)
 
     g = enhance_contrast_grayscale(base)
@@ -731,7 +950,6 @@ def build_cjk_variants(roi_bgr: np.ndarray) -> list[np.ndarray]:
     variants.append(255 - cmask)
 
     thr = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9)
-    # Thresholded variants improve high-contrast strokes.
     variants.append(thr)
     variants.append(255 - thr)
 
@@ -739,31 +957,35 @@ def build_cjk_variants(roi_bgr: np.ndarray) -> list[np.ndarray]:
 
 
 def build_cjk_name_variants(roi_bgr: np.ndarray) -> list[np.ndarray]:
-    """Generate extra CJK variants tuned for HUD names.
+    """
+    Build extra preprocessing variants tuned for HUD player names (CJK).
 
-    Rules:
-    - when FAST_OCR is enabled, skip inverted masks and dilations
+    Purpose:
+      - Expand `build_cjk_variants()` with name-specific transforms.
+      - Capture thin strokes and pale cyan text used in name plates.
 
     Args:
-      roi_bgr: ROI image in BGR.
+      roi_bgr:
+        - ROI image in BGR.
 
     Returns:
-      List of variant images.
+      - A list of variant images suitable for OCR.
+
+    Notes:
+      - Adds an aggressive stretch for very small ROIs (improves vertical stroke separation).
+      - Adds HUD cyan mask + optional inverted/dilated forms (disabled in FAST_OCR).
     """
-    # Start from the generic CJK variants.
     variants = build_cjk_variants(roi_bgr)
     if roi_bgr is None or roi_bgr.size == 0:
         return variants
 
     h, w = roi_bgr.shape[:2]
     if min(h, w) < 180:
-        # Stretch vertically to better separate stacked strokes.
         stretch = cv2.resize(roi_bgr, None, fx=2.4, fy=3.2, interpolation=cv2.INTER_CUBIC)
         stretch = unsharp(stretch, amount=1.7, sigma=1.0)
         variants.append(stretch)
 
     hud = mask_hud_cyan_regions(roi_bgr)
-    # Add HUD-specific cyan masks.
     variants.append(hud)
     if FAST_OCR:
         return variants
@@ -777,6 +999,24 @@ def build_cjk_name_variants(roi_bgr: np.ndarray) -> list[np.ndarray]:
 # OCR wrapper
 # =============================================================================
 def _looks_like_onednn_pir_bug(err: Exception) -> bool:
+    """
+    Heuristically detect oneDNN / PIR-related Paddle runtime failures.
+
+    Purpose:
+      - Identify a known class of intermittent MKLDNN/PIR errors.
+      - Enable automatic fallback to a MKLDNN-OFF engine when detected.
+
+    Args:
+      err:
+        - The exception raised by Paddle/PaddleOCR inference.
+
+    Returns:
+      - True if the error message contains signatures commonly associated with oneDNN/PIR crashes.
+
+    Notes:
+      - This is string-based detection; it is intentionally broad to catch multiple variants.
+      - Used only as a guard for retry logic when MKLDNN is enabled.
+    """
     s = str(err)
     return (
         "onednn_instruction" in s
@@ -788,15 +1028,68 @@ def _looks_like_onednn_pir_bug(err: Exception) -> bool:
         or "Unimplemented" in s
     )
 
-def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str, float]]:
-    """Run OCR on an image and return text/confidence lines.
+
+def ocr_lines_cached(
+    image: np.ndarray,
+    language_code: LanguageCode,
+    cache: dict[tuple[str, int, tuple[int, ...]], list[tuple[str, float]]],
+) -> list[tuple[str, float]]:
+    """
+    OCR with a lightweight per-request cache.
+
+    Purpose:
+      - Avoid running OCR multiple times on the same ndarray variant within a single request.
+      - Reduce CPU load when several parsing stages reuse the same crops/masks.
 
     Args:
-      image: Input image.
-      language_code: OCR language code.
+      image:
+        - The image/mask to OCR.
+      language_code:
+        - OCR language code.
+      cache:
+        - Dict keyed by (language, object-id, shape) storing OCR outputs.
 
     Returns:
-      List of (text, confidence) tuples.
+      - List of (text, confidence) tuples.
+
+    Notes:
+      - Cache key uses `id(image)` and `image.shape`, assuming the same ndarray object is reused.
+      - Cache lifetime is the request; callers pass a fresh dict per pipeline run.
+    """
+    """Run OCR on an image with caching."""
+    if image is None or image.size == 0:
+        return []
+    key = (str(language_code), id(image), tuple(image.shape))
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    out = ocr_lines(image, language_code)
+    cache[key] = out
+    return out
+
+
+def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str, float]]:
+    """
+    Run OCR and normalize PaddleOCR outputs into (text, confidence) lines.
+
+    Purpose:
+      - Provide a stable OCR interface across PaddleOCR 2.x and 3.x output formats.
+      - Implement automatic fallback when MKLDNN hits known oneDNN/PIR issues.
+
+    Args:
+      image:
+        - Input image or mask (BGR or single-channel). Empty images return [].
+      language_code:
+        - OCR language to use for recognition.
+
+    Returns:
+      - A list of (text, confidence) tuples, best-effort.
+
+    Notes:
+      - If the engine exposes `.predict()`, it is used; otherwise `.ocr()`.
+      - When MKLDNN is enabled and the error looks like a oneDNN/PIR crash,
+        the function retries once using a MKLDNN-OFF engine cached in `OCR_ENGINES_NO_MKLDNN`.
+      - Confidence values are cast to float; missing scores become 0.0.
     """
     # Guard against empty inputs to avoid OCR errors.
     if image is None or image.size == 0:
@@ -830,7 +1123,22 @@ def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str,
     out: list[tuple[str, float]] = []
 
     def _add_text(text: str | None, score: float | None) -> None:
-        """Append a normalized text + score pair if valid."""
+        """
+        Internal helper: normalize and append a text line.
+
+        Purpose:
+          - Centralize cleaning and confidence parsing.
+          - Skip empty/whitespace-only strings.
+
+        Args:
+          text:
+            - Recognized text (may be None or empty).
+          score:
+            - Confidence score (may be None or non-float).
+
+        Returns:
+          - None (mutates the outer `out` list).
+        """
         if not text:
             return
         cleaned = str(text).strip()
@@ -843,11 +1151,27 @@ def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str,
         out.append((cleaned, conf))
 
     def _extract_from_dict(data: dict) -> None:
-        """Extract OCR lines from a PaddleOCR 3.x result dict."""
+        """
+        Internal helper: extract text/score fields from PaddleOCR 3.x dict-like outputs.
+
+        Purpose:
+          - Support multiple nested result layouts produced by PaddleOCR 3.x.
+          - Walk through likely fields ("rec_texts", "rec_text", "ocr_res", etc.)
+
+        Args:
+          data:
+            - A dict potentially containing OCR text/score fields (possibly nested).
+
+        Returns:
+          - None (mutates the outer `out` list).
+
+        Notes:
+          - This function is defensive: it checks types before iterating.
+          - It recurses into known nesting keys where Paddle may embed results.
+        """
         if not isinstance(data, dict):
             return
 
-        # Direct rec_texts / rec_scores arrays.
         rec_texts = data.get("rec_texts")
         rec_scores = data.get("rec_scores")
         if isinstance(rec_texts, list):
@@ -858,15 +1182,12 @@ def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str,
                 for text in rec_texts:
                     _add_text(text, None)
 
-        # Direct single record.
         if isinstance(data.get("rec_text"), str) or data.get("rec_text") is not None:
             _add_text(data.get("rec_text"), data.get("rec_score"))
 
-        # Some pipelines return a flat "text"/"score".
         if isinstance(data.get("text"), str) or data.get("text") is not None:
             _add_text(data.get("text"), data.get("score") or data.get("rec_score"))
 
-        # Nested structures from OCR pipelines.
         if isinstance(data.get("res"), dict):
             _extract_from_dict(data["res"])
         if isinstance(data.get("overall_ocr_res"), dict):
@@ -922,15 +1243,23 @@ def ocr_lines(image: np.ndarray, language_code: LanguageCode) -> list[tuple[str,
 
 
 def join_lines(lines: list[tuple[str, float]]) -> str:
-    """Join OCR lines into a single normalized string.
+    """
+    Join OCR line tuples into a single space-normalized string.
+
+    Purpose:
+      - Produce a single text blob for downstream regex parsing.
+      - Drop confidence values while preserving original ordering.
 
     Args:
-      lines: List of (text, confidence) tuples.
+      lines:
+        - List of (text, confidence) tuples.
 
     Returns:
-      Joined string.
+      - A single string formed by joining texts with spaces and trimming ends.
+
+    Notes:
+      - Confidence is intentionally ignored here; selection is done elsewhere.
     """
-    # Drop confidences and keep order.
     return " ".join([t for t, _ in lines]).strip()
 
 
@@ -938,56 +1267,81 @@ def join_lines(lines: list[tuple[str, float]]) -> str:
 # Script profiling + scoring
 # =============================================================================
 def remove_all_whitespace(text: str) -> str:
-    """Remove all whitespace from a string.
+    """
+    Remove all whitespace characters from a string.
+
+    Purpose:
+      - Normalize OCR outputs for script counting and similarity.
+      - Avoid discrepancies caused by OCR inserting random spaces.
 
     Args:
-      text: Input string.
+      text:
+        - Input string (may be empty/None-like).
 
     Returns:
-      String without whitespace.
+      - String with all whitespace removed.
     """
-    # Normalize spacing for comparisons.
     return re.sub(RE_SPACES, "", text or "")
 
 
 def count_cjk(text: str) -> int:
-    """Count CJK characters in a string.
+    """
+    Count the number of CJK (Hangul/Kana/Han) characters in text.
+
+    Purpose:
+      - Detect whether a string should follow the CJK matching path.
+      - Avoid treating mixed strings as ASCII-only.
 
     Args:
-      text: Input string.
+      text:
+        - Input string.
 
     Returns:
-      Number of CJK characters.
+      - Number of matched CJK characters.
     """
-    # Use the precompiled CJK regex for speed.
     return len(RE_CJK_CHAR.findall(text or ""))
 
 
 def fraction_of_unicode_class(unicode_class_pattern: str, text: str) -> float:
-    """Return the fraction of characters matching a Unicode class.
+    """
+    Compute the fraction of characters matching a given Unicode class.
+
+    Purpose:
+      - Build a script profile (Hangul/Kana/Han/Latin) for a string.
+      - Compare expected script distributions by language.
 
     Args:
-      unicode_class_pattern: Character class regex.
-      text: Input string.
+      unicode_class_pattern:
+        - Character class range string (e.g., Hangul range).
+      text:
+        - Input text to analyze.
 
     Returns:
-      Fraction of matching characters.
+      - A float in [0, 1] representing the ratio among non-whitespace chars.
+
+    Notes:
+      - Whitespace is removed before computation.
+      - Returns 0.0 for empty strings after compaction.
     """
-    # Compare against a whitespace-stripped view of the string.
     compact = remove_all_whitespace(text)
     return 0.0 if not compact else len(re.findall(f"[{unicode_class_pattern}]", compact)) / len(compact)
 
 
 def build_script_profile(text: str) -> ScriptProfile:
-    """Compute a script profile for Hangul/Kana/Han/Latin ratios.
+    """
+    Build a ScriptProfile with Hangul/Kana/Han/Latin ratios.
+
+    Purpose:
+      - Provide script-aware scoring and matching for multilingual OCR.
+      - Used for candidate scoring and language selection heuristics.
 
     Args:
-      text: Input string.
+      text:
+        - Input string.
 
     Returns:
-      ScriptProfile with ratios.
+      - ScriptProfile with per-script fractions.
     """
-    # Ratios are used for script-aware scoring.
     return ScriptProfile(
         hangul=fraction_of_unicode_class(_HANGUL, text),
         kana=fraction_of_unicode_class(_HIRAKATA, text),
@@ -997,81 +1351,83 @@ def build_script_profile(text: str) -> ScriptProfile:
 
 
 def expected_script_for_language(language_code: str) -> str:
-    """Return the expected script name for a language.
+    """
+    Map a language code to its expected dominant script.
+
+    Purpose:
+      - Provide a coarse prior for scoring OCR name candidates.
 
     Args:
-      language_code: Language identifier.
+      language_code:
+        - Language identifier string.
 
     Returns:
-      Script name string.
+      - One of: "hangul", "kana", "han", "latin".
+
+    Notes:
+      - Defaults to "latin" when language is unknown.
     """
-    # Fall back to Latin for unknown language codes.
     return {"korean": "hangul", "japan": "kana", "ch": "han", "en": "latin"}.get(language_code, "latin")
 
 
 def roi_label_weight(roi: RoiLabel) -> float:
-    """Assign a weight based on ROI reliability.
+    """
+    Assign a heuristic weight to an ROI label based on reliability.
+
+    Purpose:
+      - Bias candidate scoring toward ROIs that are more trustworthy for names.
 
     Args:
-      roi: ROI label.
+      roi:
+        - ROI label ("BL", "TR", "BAN", "TL").
 
     Returns:
-      Weight as a float.
+      - Weight value added to candidate scores.
+
+    Notes:
+      - BL is the most reliable for names; TL is least.
     """
-    # Bottom-left is most reliable for names.
     return {"BL": 0.35, "TR": 0.25, "BAN": 0.10, "TL": 0.05}.get(roi, 0.0)
 
 
 def normalize_banner_fragment(fragment_text: str) -> str:
-    """Normalize banner OCR fragments for parsing.
+    """
+    Normalize banner OCR fragments into a cleaner parseable string.
+
+    Purpose:
+      - Reduce OCR noise (extra spaces and punctuation) before regex parsing.
+      - Improve banner name/time extraction stability.
 
     Args:
-      fragment_text: Raw banner fragment.
+      fragment_text:
+        - Raw OCR text assembled from banner variants.
 
     Returns:
-      Normalized banner text.
+      - Normalized string with collapsed spaces and trimmed punctuation.
     """
-    # Collapse noisy separators and trim punctuation.
     return re.sub(RE_CLEAN_BANNER_FRAGMENT, " ", (fragment_text or "")).strip(" :|~!.,*_-").strip()
 
 
-def ocr_with_labels(image: np.ndarray, language_code: LanguageCode, roi_label: RoiLabel) -> list["OcrCandidate"]:
-    """Run OCR and attach language/ROI metadata to each candidate.
-
-    Args:
-      image: Input image.
-      language_code: OCR language code.
-      roi_label: ROI label.
-
-    Returns:
-      List of OcrCandidate.
-    """
-    # Build structured candidates for scoring.
-    out: list[OcrCandidate] = []
-    for text, conf in ocr_lines(image, language_code):
-        out.append(
-            OcrCandidate(
-                text=text.strip(),
-                confidence=float(conf or 0.0),
-                language_code=language_code,
-                roi_label=roi_label,
-                profile=build_script_profile(text),
-            )
-        )
-    return out
-
-
 def _cjk_best_substring_min(text: str, min_len: int) -> str | None:
-    """Extract the longest contiguous CJK substring with a minimum length.
+    """
+    Extract the longest contiguous CJK substring meeting a minimum length.
+
+    Purpose:
+      - Pull the most likely name segment from noisy mixed OCR strings.
+      - Avoid short accidental matches that are not real names.
 
     Args:
-      text: Input string.
-      min_len: Minimum accepted length.
+      text:
+        - Input string possibly containing CJK content.
+      min_len:
+        - Minimum length required for a returned substring.
 
     Returns:
-      Longest CJK substring or None.
+      - The longest CJK substring if >= min_len, else None.
+
+    Notes:
+      - Uses `RE_CJK_SEQ` to find contiguous runs.
     """
-    # Prefer the longest CJK span as the candidate.
     if not text:
         return None
     best = ""
@@ -1083,178 +1439,115 @@ def _cjk_best_substring_min(text: str, min_len: int) -> str | None:
 
 
 def _cjk_best_substring(text: str) -> str | None:
-    """Extract the longest contiguous CJK substring.
+    """
+    Extract the longest contiguous CJK substring (minimum length = 2).
+
+    Purpose:
+      - Convenience wrapper around `_cjk_best_substring_min()` for common use.
 
     Args:
-      text: Input string.
+      text:
+        - Input string.
 
     Returns:
-      Longest CJK substring or None.
+      - Longest CJK substring if length >= 2, else None.
     """
     return _cjk_best_substring_min(text, 2)
 
 
 # =============================================================================
-# ASCII normalization helpers
+# Similarity helpers (hints: 90% matching)
 # =============================================================================
-def _clean_ascii_token(raw: str) -> str:
-    """Normalize ASCII tokens and reduce OCR noise.
+def _levenshtein_distance(a: str, b: str) -> int:
+    """
+    Compute Levenshtein edit distance between two strings.
+
+    Purpose:
+      - Provide a robust similarity measure for short OCR strings.
+      - Used for both ASCII and CJK candidate matching.
 
     Args:
-      raw: Raw OCR token.
+      a:
+        - First string.
+      b:
+        - Second string.
 
     Returns:
-      Cleaned token.
+      - Integer edit distance (0 = identical).
+
+    Notes:
+      - Uses a memory-optimized DP row approach.
+      - Ensures `a` is the shorter string to reduce memory footprint.
     """
-    # Remove accents/diacritics before ASCII cleanup.
-    norm = unicodedata.normalize("NFKD", (raw or ""))
-    norm = "".join(ch for ch in norm if not unicodedata.combining(ch))
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
 
-    # Uppercase and remove non-alphanumerics first.
-    s = re.sub(r"[^A-Z0-9_]", "", norm.upper()).strip("_")
-    if not s:
-        return ""
+    # Ensure a is the shorter string for less memory.
+    if len(a) > len(b):
+        a, b = b, a
 
-    # Strip huge digit tails that look like scores.
-    m_tail = re.search(r"\d{6,}$", s)
-    if m_tail:
-        prefix = s[: m_tail.start()]
-        if len(prefix) >= 3 and sum(ch.isalpha() for ch in prefix) >= 2:
-            s = prefix
-
-    # "polluted" heuristic (badge + OCR confusions)
-    digit_count = sum(ch.isdigit() for ch in s)
-    polluted = (len(s) >= 12 and digit_count >= 3)
-
-    if polluted:
-        # Normalize look-alike digits only for polluted cases.
-        s_for_prefix = s.replace("1", "I")
-        for p in _ROMAN_PREFIXES:
-            if s_for_prefix.startswith(p) and (len(s_for_prefix) - len(p)) >= 3:
-                s = s[len(p) :]
-                break
-
-        s = (
-            s.replace("0", "O")
-            .replace("1", "I")
-            .replace("5", "S")
-            .replace("8", "B")
-            .replace("2", "Z")
-        )
-
-    return s
+    prev = list(range(len(a) + 1))
+    for j, bj in enumerate(b, start=1):
+        cur = [j]
+        for i, ai in enumerate(a, start=1):
+            ins = cur[i - 1] + 1
+            dele = prev[i] + 1
+            sub = prev[i - 1] + (0 if ai == bj else 1)
+            cur.append(min(ins, dele, sub))
+        prev = cur
+    return prev[-1]
 
 
-def _strip_rank_prefix_ascii(name: str) -> str:
+def _levenshtein_ratio(a: str, b: str) -> float:
     """
-    Strip roman numeral rank prefixes when safe.
+    Convert Levenshtein distance to a normalized similarity ratio.
 
-    Rules:
-    - prefix is roman numeral (or OCR '1' -> 'I')
-    - suffix length is at least 3 characters
-    - suffix matches the ASCII name regex
+    Purpose:
+      - Provide a similarity score in [0, 1] that is length-aware.
 
     Args:
-      name: Raw ASCII name token.
+      a:
+        - First string.
+      b:
+        - Second string.
 
     Returns:
-      Cleaned name token.
+      - 1.0 if identical, else 1 - (distance / max_len), clipped to [0, 1].
+
+    Notes:
+      - Returns 0.0 when either string is empty.
     """
-    # Work on a normalized token.
-    s = _clean_ascii_token(name)
-    if not s:
-        return s
-
-    s_for_prefix = s.replace("1", "I")
-    for p in _ROMAN_PREFIXES:
-        if s_for_prefix.startswith(p):
-            suffix = s[len(p) :]
-            # avoid stripping "IVAN" (suffix too short)
-            if len(suffix) >= 3 and re.fullmatch(RE_ASCII_NAME_MATCH, suffix):
-                return suffix
-            return s
-    return s
-
-
-def _strip_rank_prefix_ascii_with_top5_hint(name: str, top5_text: str | None) -> str:
-    """
-    Strip rank prefix only if TOP5 confirms the suffix.
-
-    Args:
-      name: Raw ASCII name token.
-      top5_text: OCR text from TOP5 block.
-
-    Returns:
-      Cleaned name token.
-    """
-    # Strip prefix only if TOP5 confirms the suffix.
-    base = _strip_rank_prefix_ascii(name)
-    if not top5_text:
-        return base
-
-    # if base didn't change -> nothing to do
-    if base == _clean_ascii_token(name):
-        # it means no prefix stripped; still keep base
-        return base
-
-    up = (top5_text or "").upper()
-    if re.search(rf"\b{re.escape(base)}\b", up):
-        return base
-
-    # If TOP5 doesn't confirm, keep original cleaned name
-    return _clean_ascii_token(name)
-
-
-def _normalize_ascii_for_compare(name: str) -> str:
-    """Normalize ASCII strings for fuzzy comparison.
-
-    Args:
-      name: Input name string.
-
-    Returns:
-      Normalized string.
-    """
-    # Map common OCR digit/letter confusions.
-    s = (name or "").upper()
-    s = (
-        s.replace("0", "O")
-        .replace("1", "I")
-        .replace("5", "S")
-        .replace("8", "B")
-        .replace("2", "Z")
-    )
-    return re.sub(r"[^A-Z0-9_]", "", s)
-
-
-def _name_variants_ascii(name: str) -> set[str]:
-    """Generate alternate ASCII variants for matching.
-
-    Args:
-      name: Input name string.
-
-    Returns:
-      Set of normalized variants.
-    """
-    # Include variants without roman prefixes.
-    s = _normalize_ascii_for_compare(name)
-    out = {s}
-    for p in _ROMAN_PREFIXES:
-        if s.startswith(p) and (len(s) - len(p)) >= 3:
-            out.add(s[len(p) :])
-            break
-    return {v for v in out if v}
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    d = _levenshtein_distance(a, b)
+    m = max(len(a), len(b))
+    return 0.0 if m <= 0 else max(0.0, 1.0 - (d / m))
 
 
 def _bigrams(s: str) -> set[str]:
-    """Create a set of bigrams for similarity scoring.
+    """
+    Generate bigrams (2-character shingles) from a string.
+
+    Purpose:
+      - Support a Jaccard similarity metric that is resilient to small edits.
+      - Works reasonably across scripts for short tokens.
 
     Args:
-      s: Input string.
+      s:
+        - Input string.
 
     Returns:
-      Set of bigrams.
+      - A set of bigram strings; for length<2 returns {s} or empty.
+
+    Notes:
+      - Whitespace is removed before shingling.
     """
-    # Use a compact string to avoid whitespace noise.
     s = remove_all_whitespace(s)
     if len(s) < 2:
         return {s} if s else set()
@@ -1262,16 +1555,25 @@ def _bigrams(s: str) -> set[str]:
 
 
 def _sim(a: str, b: str) -> float:
-    """Compute Jaccard similarity over bigrams.
+    """
+    Compute Jaccard similarity on bigram sets.
+
+    Purpose:
+      - Provide a fast approximate similarity for OCR tokens.
+      - Useful for clustering and containment heuristics.
 
     Args:
-      a: First string.
-      b: Second string.
+      a:
+        - First string.
+      b:
+        - Second string.
 
     Returns:
-      Similarity score between 0 and 1.
+      - Jaccard similarity in [0, 1].
+
+    Notes:
+      - Returns 0.0 if either bigram set is empty.
     """
-    # Compare bigram sets for a simple similarity metric.
     A = _bigrams(a)
     B = _bigrams(b)
     if not A or not B:
@@ -1281,16 +1583,102 @@ def _sim(a: str, b: str) -> float:
     return inter / uni if uni else 0.0
 
 
-def _toggle_hangul_tense(ch: str) -> str | None:
-    """Toggle a Hangul syllable's tense initial consonant if possible.
+def _norm_cjk(s: str) -> str:
+    """
+    Normalize CJK strings for robust comparison.
+
+    Purpose:
+      - Remove invisible characters and normalize compatibility forms.
+      - Improve matching when OCR uses variant code points or spacing.
 
     Args:
-      ch: Hangul syllable.
+      s:
+        - Input string.
 
     Returns:
-      Toggled Hangul syllable or None if unchanged.
+      - Normalized string (NFKC, whitespace removed, zero-width chars removed).
+
+    Notes:
+      - Strips common zero-width characters: U+200B and BOM (U+FEFF).
     """
-    # Only handle precomposed Hangul syllables.
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    s = remove_all_whitespace(s)
+    s = s.replace("\u200b", "").replace("\ufeff", "")
+    return s
+
+
+def _normalize_ascii_for_compare(name: str) -> str:
+    """
+    Normalize ASCII name tokens for fuzzy matching.
+
+    Purpose:
+      - Reduce common OCR confusions (0/O, 1/I, 5/S, 8/B, 2/Z).
+      - Keep only characters relevant to BattleTag-like identifiers.
+
+    Args:
+      name:
+        - Raw name string.
+
+    Returns:
+      - Uppercased, sanitized string containing A-Z, 0-9, underscore.
+
+    Notes:
+      - Intended for matching, not for display.
+    """
+    s = (name or "").upper()
+    s = s.replace("0", "O").replace("1", "I").replace("5", "S").replace("8", "B").replace("2", "Z")
+    return re.sub(r"[^A-Z0-9_]", "", s)
+
+
+def _name_variants_ascii(name: str) -> set[str]:
+    """
+    Generate ASCII variants for name matching.
+
+    Purpose:
+      - Account for roman numeral rank prefixes that may be attached by OCR.
+      - Provide a small candidate set for robust equality/containment checks.
+
+    Args:
+      name:
+        - Raw name string.
+
+    Returns:
+      - Set of normalized variants.
+
+    Notes:
+      - Produces the base normalized token plus an optional prefix-stripped token.
+      - Only strips the first matching roman prefix where the remaining suffix stays length-safe.
+    """
+    s = _normalize_ascii_for_compare(name)
+    out = {s}
+    for p in _ROMAN_PREFIXES:
+        if s.startswith(p) and (len(s) - len(p)) >= 3:
+            out.add(s[len(p) :])
+            break
+    return {v for v in out if v}
+
+
+def _toggle_hangul_tense(ch: str) -> str | None:
+    """
+    Toggle Hangul tense initial consonant (where applicable) for a syllable.
+
+    Purpose:
+      - Compensate for OCR confusion between tense and non-tense initials (e.g., ㄱ/ㄲ).
+      - Generate plausible name variants for matching.
+
+    Args:
+      ch:
+        - Single-character string.
+
+    Returns:
+      - The toggled Hangul syllable character if applicable, else None.
+
+    Notes:
+      - Only works for Hangul syllables in U+AC00..U+D7A3.
+      - Keeps Jung/Jong components intact.
+    """
     code = ord(ch)
     if code < _HANGUL_BASE or code > _HANGUL_END:
         return None
@@ -1309,16 +1697,26 @@ def _toggle_hangul_tense(ch: str) -> str | None:
 
 
 def _hangul_tense_variants(text: str, max_variants: int = 64) -> list[str]:
-    """Generate Hangul variants by toggling tense initials.
+    """
+    Generate Hangul variants by toggling tense initial consonants across positions.
+
+    Purpose:
+      - Produce a bounded set of candidate names to tolerate OCR errors in Hangul initials.
+      - Improve matching without requiring another OCR pass.
 
     Args:
-      text: Input Hangul string.
-      max_variants: Maximum number of variants to generate.
+      text:
+        - Input Hangul-containing string.
+      max_variants:
+        - Maximum number of variants to generate (hard cap).
 
     Returns:
-      List of unique variants including the original.
+      - List of unique variants including the original string.
+
+    Notes:
+      - Uses a DFS walk that toggles each eligible character position on/off.
+      - Stops generating once `max_variants` is reached.
     """
-    # Build a list of positions that can be toggled.
     positions: list[tuple[int, str]] = []
     for idx, ch in enumerate(text):
         toggled = _toggle_hangul_tense(ch)
@@ -1331,16 +1729,28 @@ def _hangul_tense_variants(text: str, max_variants: int = 64) -> list[str]:
     variants: set[str] = set()
 
     def _walk(i: int, current: list[str]) -> None:
-        """Recursive builder for variant combinations."""
+        """
+        Internal DFS generator for tense toggling combinations.
+
+        Purpose:
+          - Enumerate combinations of toggles while respecting max_variants.
+
+        Args:
+          i:
+            - Index into `positions`.
+          current:
+            - Current mutable character list.
+
+        Returns:
+          - None (mutates outer `variants`).
+        """
         if len(variants) >= max_variants:
             return
         if i >= len(positions):
             variants.add("".join(current))
             return
         pos, toggled = positions[i]
-        # Keep original.
         _walk(i + 1, current)
-        # Toggle this position.
         current2 = current.copy()
         current2[pos] = toggled
         _walk(i + 1, current2)
@@ -1350,52 +1760,325 @@ def _hangul_tense_variants(text: str, max_variants: int = 64) -> list[str]:
     return list(variants)
 
 
-def _pick_hangul_variant(name: str, evidence: list[str]) -> str:
-    """Pick a Hangul variant that best matches evidence tokens.
+def name_similarity(a: str | None, b: str | None) -> float:
+    """
+    Compute a script-aware similarity score between two names.
+
+    Purpose:
+      - Compare OCR-extracted names with hints or other sources robustly.
+      - Use CJK-aware normalization and Hangul-specific tolerance when applicable.
 
     Args:
-      name: Base Hangul name.
-      evidence: List of OCR-derived CJK tokens from other regions.
+      a:
+        - First name string (may be None).
+      b:
+        - Second name string (may be None).
 
     Returns:
-      Best matching Hangul variant.
+      - Similarity score in [0, 1].
+
+    Notes:
+      - If either string contains meaningful CJK (>=2 chars), uses CJK path:
+        - NFKC normalization + whitespace stripping
+        - containment heuristic
+        - Levenshtein ratio and bigram Jaccard
+        - Hangul tense variants for Korean-heavy strings
+      - Otherwise uses ASCII path:
+        - normalized variants + containment + Levenshtein ratio
     """
-    # If no evidence, keep the original.
-    if not evidence:
-        return name
+    if not a or not b:
+        return 0.0
 
-    variants = _hangul_tense_variants(name)
-    if len(variants) <= 1:
-        return name
+    # CJK path (either string contains meaningful CJK)
+    if count_cjk(a) >= 2 or count_cjk(b) >= 2:
+        aa = _norm_cjk(a)
+        bb = _norm_cjk(b)
+        if not aa or not bb:
+            return 0.0
+        if aa == bb:
+            return 1.0
 
-    def _score_variant(v: str) -> float:
-        """Score variant by max similarity to evidence tokens."""
-        return max((_sim(v, e) for e in evidence), default=0.0)
+        best = 0.0
 
-    base_score = _score_variant(name)
-    best = name
-    best_score = base_score
-    for v in variants:
-        if v == name:
-            continue
-        score = _score_variant(v)
-        if score > best_score + 0.05:
-            best_score = score
-            best = v
+        # Containment heuristic (useful if OCR adds one extra char)
+        if aa in bb or bb in aa:
+            best = max(best, min(len(aa), len(bb)) / max(len(aa), len(bb)))
+
+        # Compare base + Hangul tense variants when relevant
+        candidates = [aa]
+        pa = build_script_profile(aa)
+        if pa.hangul >= 0.45:
+            candidates.extend(_hangul_tense_variants(aa, max_variants=32))
+
+        for cand in set(candidates):
+            best = max(best, _levenshtein_ratio(cand, bb), _sim(cand, bb))
+
+        return best
+
+    # ASCII path
+    va = _name_variants_ascii(a)
+    vb = _name_variants_ascii(b)
+    if not va or not vb:
+        return 0.0
+
+    best = 0.0
+    for x in va:
+        for y in vb:
+            if x == y:
+                return 1.0
+            if x in y or y in x:
+                best = max(best, min(len(x), len(y)) / max(len(x), len(y)))
+            best = max(best, _levenshtein_ratio(x, y))
     return best
 
 
-def _score_name_candidate(c: OcrCandidate, cleaned_text: str) -> float:
-    """Score a candidate name using script profile and confidence.
+def names_match_strict(a: str | None, b: str | None, threshold: float = HINT_MATCH_THRESHOLD) -> bool:
+    """
+    Strict name match predicate (used for hint validation).
+
+    Purpose:
+      - Decide whether an OCR name "matches" a provided hint strongly enough to trust it.
 
     Args:
-      c: OCR candidate with metadata.
-      cleaned_text: Cleaned candidate text.
+      a:
+        - Candidate name (e.g., OCR output).
+      b:
+        - Reference name (e.g., provided hint).
+      threshold:
+        - Similarity threshold; defaults to HINT_MATCH_THRESHOLD (typically 0.90).
 
     Returns:
-      Score as a float.
+      - True if similarity(a, b) >= threshold, else False.
+
+    Notes:
+      - Uses `name_similarity()` under the hood (script-aware).
     """
-    # Favor candidates that match the expected script.
+    return name_similarity(a, b) >= threshold
+
+
+def _normalize_code_for_compare(code: str) -> str:
+    """
+    Normalize a map code for fuzzy comparisons.
+
+    Purpose:
+      - Make code matching resilient to OCR character confusions.
+      - Ensure codes compare in a stable alphanumeric form.
+
+    Args:
+      code:
+        - Raw map code string.
+
+    Returns:
+      - Uppercased, alphanumeric-only string with OCR confusion remaps applied.
+
+    Notes:
+      - Applies NFKC normalization and then strips non A-Z/0-9.
+      - Remaps letters that OCR confuses with digits and vice-versa (safe for codes).
+    """
+    s = unicodedata.normalize("NFKC", (code or ""))
+    s = s.upper()
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    # Common OCR confusions (safe for codes)
+    s = s.replace("O", "0").replace("I", "1").replace("L", "1").replace("S", "5").replace("B", "8").replace("Z", "2")
+    return s
+
+
+def code_similarity(a: str | None, b: str | None) -> float:
+    """
+    Compute similarity between two map codes.
+
+    Purpose:
+      - Validate whether OCR and provided code hint refer to the same map.
+      - Allow minor OCR errors while keeping strictness high.
+
+    Args:
+      a:
+        - First code (may be None).
+      b:
+        - Second code (may be None).
+
+    Returns:
+      - Similarity score in [0, 1].
+
+    Notes:
+      - Uses normalized codes and returns max(Levenshtein ratio, bigram Jaccard).
+    """
+    if not a or not b:
+        return 0.0
+    aa = _normalize_code_for_compare(a)
+    bb = _normalize_code_for_compare(b)
+    if not aa or not bb:
+        return 0.0
+    if aa == bb:
+        return 1.0
+    return max(_levenshtein_ratio(aa, bb), _sim(aa, bb))
+
+
+def time_similarity(extracted: float | None, hinted: float | None) -> float:
+    """
+    Compute similarity between two time values.
+
+    STRICT ABSOLUTE policy:
+    - Return 1.0 ONLY if abs(extracted - hinted) <= HINT_TIME_ABS_TOL
+    - Otherwise return 0.0
+
+    Rationale:
+    - Relative comparisons are too permissive for large times (e.g. 4330 vs 4334.43).
+    - We want "time hint" validation to behave like an absolute tolerance in seconds.
+    """
+    if extracted is None or hinted is None:
+        return 0.0
+    try:
+        a = float(extracted)
+        b = float(hinted)
+    except Exception:
+        return 0.0
+    if a <= 0 or b <= 0:
+        return 0.0
+
+    diff = abs(a - b)
+    return 1.0 if diff <= HINT_TIME_ABS_TOL else 0.0
+
+
+# =============================================================================
+# NAME scoring helpers
+# =============================================================================
+def _clean_ascii_token(raw: str) -> str:
+    """
+    Clean and normalize a raw OCR token into a plausible ASCII name candidate.
+
+    Purpose:
+      - Reduce OCR noise and normalize diacritics.
+      - Remove invalid characters and mitigate common OCR artifacts.
+
+    Args:
+      raw:
+        - Raw token extracted from OCR text.
+
+    Returns:
+      - Uppercased token restricted to [A-Z0-9_] with some heuristics applied.
+
+    Notes:
+      - Strips combining marks (NFKD) to remove accents.
+      - Removes long trailing digit sequences that look like false OCR tails.
+      - If token is "polluted" (many digits), applies roman-prefix removal and digit->letter fixes.
+    """
+    norm = unicodedata.normalize("NFKD", (raw or ""))
+    norm = "".join(ch for ch in norm if not unicodedata.combining(ch))
+    s = re.sub(r"[^A-Z0-9_]", "", norm.upper()).strip("_")
+    if not s:
+        return ""
+
+    m_tail = re.search(r"\d{6,}$", s)
+    if m_tail:
+        prefix = s[: m_tail.start()]
+        if len(prefix) >= 3 and sum(ch.isalpha() for ch in prefix) >= 2:
+            s = prefix
+
+    digit_count = sum(ch.isdigit() for ch in s)
+    polluted = (len(s) >= 12 and digit_count >= 3)
+
+    if polluted:
+        s_for_prefix = s.replace("1", "I")
+        for p in _ROMAN_PREFIXES:
+            if s_for_prefix.startswith(p) and (len(s_for_prefix) - len(p)) >= 3:
+                s = s[len(p) :]
+                break
+
+        s = s.replace("0", "O").replace("1", "I").replace("5", "S").replace("8", "B").replace("2", "Z")
+
+    return s
+
+
+def _strip_rank_prefix_ascii(name: str) -> str:
+    """
+    Strip a roman numeral prefix from an ASCII name when it is safe.
+
+    Purpose:
+      - Remove leaderboard rank prefixes that OCR sometimes merges into the name.
+      - Keep the name stable for matching across banner/TOP5.
+
+    Args:
+      name:
+        - Raw name token.
+
+    Returns:
+      - Cleaned token with a safe roman prefix removed if applicable.
+
+    Notes:
+      - Only strips if the remaining suffix still matches the ASCII name pattern and is length-safe.
+    """
+    s = _clean_ascii_token(name)
+    if not s:
+        return s
+
+    s_for_prefix = s.replace("1", "I")
+    for p in _ROMAN_PREFIXES:
+        if s_for_prefix.startswith(p):
+            suffix = s[len(p) :]
+            if len(suffix) >= 3 and re.fullmatch(RE_ASCII_NAME_MATCH, suffix):
+                return suffix
+            return s
+    return s
+
+
+def _strip_rank_prefix_ascii_with_top5_hint(name: str, top5_text: str | None) -> str:
+    """
+    Strip rank prefix only if TOP5 text provides evidence for the suffix.
+
+    Purpose:
+      - Prevent over-stripping when OCR mistakes a real name prefix for a rank.
+      - Use TOP5 presence as a confirmation signal.
+
+    Args:
+      name:
+        - Raw or partially cleaned ASCII name.
+      top5_text:
+        - OCR text from TOP5 area (may be empty/None).
+
+    Returns:
+      - Possibly prefix-stripped name, otherwise the cleaned original.
+
+    Notes:
+      - If stripping changed the name but the stripped form is not found in TOP5,
+        returns the non-stripped cleaned token instead.
+    """
+    base = _strip_rank_prefix_ascii(name)
+    if not top5_text:
+        return base
+
+    if base == _clean_ascii_token(name):
+        return base
+
+    up = (top5_text or "").upper()
+    if re.search(rf"\b{re.escape(base)}\b", up):
+        return base
+
+    return _clean_ascii_token(name)
+
+
+def _score_name_candidate(c: OcrCandidate, cleaned_text: str) -> float:
+    """
+    Score a name candidate using OCR confidence + script/ROI heuristics.
+
+    Purpose:
+      - Rank candidates across languages/variants by combining confidence with plausibility.
+      - Prefer names that match the expected script for their OCR language.
+
+    Args:
+      c:
+        - Candidate metadata including OCR confidence, language, ROI label.
+      cleaned_text:
+        - Cleaned candidate text used for profiling/length checks.
+
+    Returns:
+      - A float score; higher is better.
+
+    Notes:
+      - Adds script-alignment bonuses (Hangul/Kana/Han).
+      - Adds length bonus to prefer non-trivial names.
+      - Adds ROI weight to prefer more reliable regions (BL/TR > banner/TL).
+    """
     exp = expected_script_for_language(c.language_code)
     prof = build_script_profile(cleaned_text)
 
@@ -1417,15 +2100,24 @@ def _score_name_candidate(c: OcrCandidate, cleaned_text: str) -> float:
 
 
 def _consensus_pick(cands: list[tuple[str, float]]) -> str | None:
-    """Pick the best name by clustering similar candidates.
+    """
+    Pick a best name by clustering similar candidates and selecting the strongest cluster.
+
+    Purpose:
+      - Stabilize name selection when OCR produces multiple near-duplicates across variants.
+      - Prefer candidates with consistent support rather than a single high-confidence outlier.
 
     Args:
-      cands: List of (name, score) candidates.
+      cands:
+        - List of (name, score) candidate pairs.
 
     Returns:
-      Best name or None.
+      - The selected name string, or None if input is empty.
+
+    Notes:
+      - Clusters are formed using bigram similarity >= 0.72.
+      - Cluster score is the sum of member scores; representative is best-scoring item.
     """
-    # Cluster candidates by similarity and pick the strongest group.
     if not cands:
         return None
 
@@ -1450,34 +2142,62 @@ def _consensus_pick(cands: list[tuple[str, float]]) -> str | None:
 
 
 # =============================================================================
-# NAME: Bottom-left extraction (source of truth)
+# NAME: Bottom-left extraction (source of truth when NO name hint provided)
 # =============================================================================
 def extract_name_from_bottom_left(
     bl_name_roi: np.ndarray,
     bl_alt_roi: np.ndarray,
+    *,
+    cache: dict,
+    name_hint: str | None = None,
 ) -> str | None:
-    """Extract player name from bottom-left HUD regions.
+    """
+    Extract the player name from the bottom-left HUD ROI(s).
+
+    Purpose:
+      - Primary name extraction path in the normal flow (no explicit names provided).
+      - Supports both ASCII and CJK names with multiple preprocessing variants.
 
     Args:
-      bl_name_roi: Tight name ROI.
-      bl_alt_roi: Alternate bottom-left ROI (unused for name extraction).
+      bl_name_roi:
+        - Bottom-left ROI expected to contain the player name.
+      bl_alt_roi:
+        - Alternate ROI (currently same in caller; kept for compatibility/experimentation).
+      cache:
+        - Per-request OCR cache dict used by `ocr_lines_cached`.
+      name_hint:
+        - Optional name hint to restrict candidates (looser than strict hint matching).
 
     Returns:
-      Extracted name or None.
+      - Best extracted name string, or None if not found.
+
+    Notes:
+      - ASCII path:
+        - OCR with EN, tokenize, clean tokens, apply heuristics and optional hint filtering.
+      - CJK path:
+        - OCR with targeted languages, build variants, score candidates, and consensus-pick.
+      - If CJK is picked, additional Hangul tense variants may be applied to improve stability.
     """
-    # Bottom-left is the primary source of truth for names.
+    """Extract player name from bottom-left HUD regions."""
     if bl_name_roi is None or bl_name_roi.size == 0:
         return None
 
-    # Only use the tight name ROI to avoid HUD pollution.
     name_rois = [bl_name_roi]
 
-    # ---- ASCII candidates (English OCR) ----
+    hint_ascii = None
+    hint_cjk = None
+    if name_hint:
+        if count_cjk(name_hint) >= 2:
+            hint_cjk = remove_all_whitespace(name_hint)
+        else:
+            hint_ascii = _normalize_ascii_for_compare(name_hint)
+
+    # ---- ASCII candidates ----
     ascii_scores: dict[str, float] = {}
     for roi in name_rois:
         if roi is None or roi.size == 0:
             continue
-        lines = ocr_lines(roi, "en")
+        lines = ocr_lines_cached(roi, "en", cache)
         text = " ".join(t for t, _ in lines).replace("|", " ")
         tokens = [t for t in re.split(RE_SPACES, (text or "")) if t]
         avg_conf = float(np.mean([c for _, c in lines])) if lines else 0.0
@@ -1496,6 +2216,10 @@ def extract_name_from_bottom_left(
             if len(tok) < MIN_NAME_LEN:
                 continue
 
+            if hint_ascii:
+                if _sim(tok, hint_ascii) < 0.55 and hint_ascii not in tok and tok not in hint_ascii:
+                    continue
+
             digit_count = sum(ch.isdigit() for ch in tok)
             letter_count = sum(ch.isalpha() for ch in tok)
             if digit_count > 0 and letter_count < 4:
@@ -1507,27 +2231,42 @@ def extract_name_from_bottom_left(
             score = avg_conf + 0.10 + max(0.0, (len(tok) - MIN_NAME_LEN) * 0.05)
             ascii_scores[tok] = ascii_scores.get(tok, 0.0) + score
 
-    # ---- CJK candidates (Korean first, multi-variant) ----
+    # ---- CJK candidates ----
     cjk_candidates: list[tuple[str, float]] = []
 
     def _collect_cjk_for_lang(lang: LanguageCode) -> None:
-        """Collect CJK candidates for a specific language.
+        """
+        Internal helper: collect CJK name candidates for a specific OCR language.
+
+        Purpose:
+          - Run OCR on multiple variants for the ROI(s) and score plausible CJK substrings.
+          - Apply script-based sanity checks per language.
 
         Args:
-          lang: Language code.
+          lang:
+            - OCR language to use ("korean", "japan", "ch", etc.)
 
         Returns:
-          None.
+          - None (appends to outer `cjk_candidates` list).
+
+        Notes:
+          - Uses `MIN_NAME_LEN` as minimum substring length.
+          - Applies optional hint filtering using bigram similarity / containment.
         """
-        # Iterate over both ROI variants and preprocessing variants.
         for roi in name_rois:
             if roi is None or roi.size == 0:
                 continue
             for v in build_cjk_name_variants(roi):
-                for cand in ocr_with_labels(v, lang, "BL"):
-                    cjk = _cjk_best_substring_min(cand.text, MIN_NAME_LEN)
+                for text, conf in ocr_lines_cached(v, lang, cache):
+                    cjk = _cjk_best_substring_min(text, MIN_NAME_LEN)
                     if not cjk:
                         continue
+
+                    if hint_cjk:
+                        cjk_compact = remove_all_whitespace(cjk)
+                        if _sim(cjk_compact, hint_cjk) < 0.55 and hint_cjk not in cjk_compact and cjk_compact not in hint_cjk:
+                            continue
+
                     prof = build_script_profile(cjk)
                     if max(prof.hangul, prof.kana, prof.han) < 0.35:
                         continue
@@ -1537,12 +2276,18 @@ def extract_name_from_bottom_left(
                         continue
                     if lang == "ch" and prof.han < 0.50:
                         continue
-                    score = _score_name_candidate(cand, cjk)
+
+                    fake = OcrCandidate(
+                        text=text.strip(),
+                        confidence=float(conf or 0.0),
+                        language_code=lang,
+                        roi_label="BL",
+                        profile=build_script_profile(text),
+                    )
+                    score = _score_name_candidate(fake, cjk)
                     cjk_candidates.append((cjk, score))
 
     _collect_cjk_for_lang("korean")
-
-    # Only expand to JP/CH if Korean signals are weak.
     strong_korean = any(build_script_profile(n).hangul >= 0.55 for n, _ in cjk_candidates)
     if not strong_korean and not FAST_OCR:
         _collect_cjk_for_lang("japan")
@@ -1551,15 +2296,24 @@ def extract_name_from_bottom_left(
     picked_cjk = _consensus_pick(cjk_candidates)
     picked_ascii = None
     if ascii_scores:
-        picked_ascii = max(
-            ascii_scores.items(),
-            key=lambda kv: (kv[1], len(kv[0]), sum(ch.isalpha() for ch in kv[0])),
-        )[0]
+        picked_ascii = max(ascii_scores.items(), key=lambda kv: (kv[1], len(kv[0])))[0]
 
     if picked_cjk and count_cjk(picked_cjk) >= MIN_NAME_LEN:
-        # Refine Hangul tense using only bottom-left evidence.
         evidence = [name for name, _ in cjk_candidates]
-        return _pick_hangul_variant(picked_cjk, evidence)
+        # If no evidence, keep the original.
+        if evidence:
+            # Try Hangul tense variants for small OCR mistakes.
+            variants = _hangul_tense_variants(picked_cjk, max_variants=64)
+            best = picked_cjk
+            best_score = max((_sim(best, e) for e in evidence), default=0.0)
+            for v in variants:
+                score = max((_sim(v, e) for e in evidence), default=0.0)
+                if score > best_score + 0.05:
+                    best_score = score
+                    best = v
+            return best
+        return picked_cjk
+
     if picked_ascii:
         picked_ascii = _clean_ascii_token(picked_ascii)
         picked_ascii = _strip_rank_prefix_ascii(picked_ascii)
@@ -1572,15 +2326,25 @@ def extract_name_from_bottom_left(
 # NAME: Banner extraction (to decide if banner time is valid)
 # =============================================================================
 def extract_name_from_banner(text_banner: str) -> str | None:
-    """Extract player name from the banner text line.
+    """
+    Extract the player name from a banner text line.
+
+    Purpose:
+      - Determine whether a banner time belongs to a specific player.
+      - Provide a name string for BL<->banner validation.
 
     Args:
-      text_banner: OCR text from the banner.
+      text_banner:
+        - OCR text assembled from the banner ROI.
 
     Returns:
-      Extracted name or None.
+      - Extracted player name (ASCII or CJK), or None if not found.
+
+    Notes:
+      - CJK extraction uses the CJK banner pattern + best substring selection.
+      - ASCII extraction cleans token, strips rank prefix, and validates against generic words.
     """
-    # Banner is used as a fallback validation source.
+    """Extract player name from the banner text line."""
     if not text_banner:
         return None
 
@@ -1602,31 +2366,54 @@ def extract_name_from_banner(text_banner: str) -> str | None:
     return None
 
 
-
-
 def names_match(a: str | None, b: str | None) -> bool:
-    """Check whether two names likely refer to the same player.
+    """
+    Lenient internal match predicate for names (BL <-> banner).
+
+    Purpose:
+      - Validate that two names likely refer to the same player without requiring strict hint-level accuracy.
+      - Support small OCR errors and Hangul tense confusions.
 
     Args:
-      a: First name.
-      b: Second name.
+      a:
+        - First name.
+      b:
+        - Second name.
 
     Returns:
-      True if they match, otherwise False.
+      - True if considered a match, else False.
+
+    Notes:
+      - CJK path:
+        - Normalizes via `_norm_cjk()`, uses containment and bigram similarity.
+        - For Korean-heavy strings, also tries Hangul tense variants.
+      - ASCII path:
+        - Compares normalized variants and containment.
     """
-    # Use script-aware logic for CJK vs ASCII.
+    """Lenient name matching for internal validations (BL <-> banner)."""
     if not a or not b:
         return False
 
+    # CJK path
     if count_cjk(a) >= 2 or count_cjk(b) >= 2:
-        aa = remove_all_whitespace(a)
-        bb = remove_all_whitespace(b)
+        aa = _norm_cjk(a)
+        bb = _norm_cjk(b)
         if aa == bb:
             return True
+
+        pa = build_script_profile(aa)
+        pb = build_script_profile(bb)
+        if pa.hangul >= 0.45 and pb.hangul >= 0.45:
+            for v in _hangul_tense_variants(aa, max_variants=32):
+                if v == bb or _sim(v, bb) >= 0.74:
+                    return True
+
         if len(aa) >= 3 and (aa in bb or bb in aa):
             return True
-        return _sim(aa, bb) >= 0.78
 
+        return _sim(aa, bb) >= 0.74
+
+    # ASCII path
     va = _name_variants_ascii(a)
     vb = _name_variants_ascii(b)
     if va & vb:
@@ -1642,15 +2429,23 @@ def names_match(a: str | None, b: str | None) -> bool:
 # TIME parsing helpers
 # =============================================================================
 def parse_loose_numeric_token(raw_token: str) -> float | None:
-    """Parse a noisy OCR numeric token into a float if possible.
+    """
+    Parse a noisy OCR numeric token into a float.
+
+    Purpose:
+      - Convert OCR text that may contain misread characters into a numeric time.
+      - Handle common OCR substitutions (O->0, S->5, etc.) and punctuation noise.
 
     Args:
-      raw_token: Raw numeric token.
+      raw_token:
+        - OCR token that should contain a number like "123.45" (but may be noisy).
 
     Returns:
-      Parsed float or None.
+      - Parsed float if a plausible value is found, else None.
+
+    Notes:
+      - Normalizes common OCR confusions before extracting a `\d{1,5}.\d{2}` pattern.
     """
-    # Normalize common OCR misreads before parsing.
     if not raw_token:
         return None
     normalized = (
@@ -1671,15 +2466,24 @@ def parse_loose_numeric_token(raw_token: str) -> float | None:
 
 
 def extract_banner_time_seconds(text: str) -> float | None:
-    """Extract a time value from the banner text.
+    """
+    Extract a time value (seconds) from banner OCR text.
+
+    Purpose:
+      - Parse the "TIME ... SEC" segment from the mission complete banner.
+      - Handle OCR distortions in keywords and digits.
 
     Args:
-      text: OCR text from the banner.
+      text:
+        - OCR text from the banner ROI.
 
     Returns:
-      Time in seconds or None.
+      - Time in seconds as float, or None if not found.
+
+    Notes:
+      - Prefer parsing near the "TIME" keyword window when present.
+      - Falls back to scanning all numeric candidates and ranking by proximity to TIME / presence of SEC.
     """
-    # Normalize OCR noise to improve numeric parsing.
     if not text:
         return None
     text = (
@@ -1695,7 +2499,6 @@ def extract_banner_time_seconds(text: str) -> float | None:
 
     time_idx = text.find("TIME")
     if time_idx != -1:
-        # Prefer numbers near the TIME keyword.
         window = text[time_idx : time_idx + 90]
         window = re.sub(r"([0-9OQDBZGISL]{1,5})\s+([0-9OQDBZGISL]{1}\.\d{2})", r"\1\2", window)
         m = re.search(RE_PARSE_BANNER_TIME_SEARCH_WITH_SEC, window)
@@ -1706,7 +2509,6 @@ def extract_banner_time_seconds(text: str) -> float | None:
 
     best: tuple[int, float] | None = None
     for m in re.finditer(RE_PARSE_BANNER_TIME_SEARCH_NO_SEC, text):
-        # Score candidates by proximity to TIME and SEC.
         cand = parse_loose_numeric_token(m.group(1))
         if cand is None:
             continue
@@ -1721,16 +2523,26 @@ def extract_banner_time_seconds(text: str) -> float | None:
 
 
 def extract_time_from_top_left(text_top_left: str, text_top_left_white: str) -> float | None:
-    """Extract a time from the top-left HUD block.
+    """
+    Extract a time value from top-left HUD OCR text.
+
+    Purpose:
+      - Parse the displayed run time from the top-left HUD panel.
+      - Combine plain OCR and white-mask OCR to improve reliability.
 
     Args:
-      text_top_left: OCR text from top-left.
-      text_top_left_white: OCR text from white mask.
+      text_top_left:
+        - OCR text from the top-left ROI.
+      text_top_left_white:
+        - OCR text from the white mask of the top-left ROI.
 
     Returns:
-      Time in seconds or None.
+      - Parsed time in seconds (float), or None.
+
+    Notes:
+      - First tries strict "NNN.NN SEC" parse.
+      - Then falls back to collecting all numeric candidates and returning the maximum.
     """
-    # Use white mask OCR first for higher precision.
     src = f"{text_top_left_white or ''} {text_top_left or ''}".upper()
     m = re.search(RE_PARSE_TIME_AGAIN, src)
     if m:
@@ -1750,86 +2562,287 @@ def extract_time_from_top_left(text_top_left: str, text_top_left_white: str) -> 
     return max(values) if values else None
 
 
-def extract_top5_text(top_right_crop: np.ndarray) -> tuple[str, str]:
-    """Extract TOP5 text and a debug OCR line.
+def validate_time_seconds(t: float | None) -> float | None:
+    """
+    Validate and clamp a candidate time value.
+
+    Purpose:
+      - Remove implausible or invalid time values before selecting/returning them.
+      - Enforce service-level constraints on acceptable run times.
 
     Args:
-      top_right_crop: Top-right ROI image.
+      t:
+        - Candidate time in seconds.
 
     Returns:
-      Tuple of (top5_text, debug_full_text).
+      - Rounded time (2 decimals) if valid, else None.
+
+    Notes:
+      - Current constraints discard values < 30.0 and > 15360 (4h 16m).
+      - Keeps rounding consistent with API output and hint comparison.
     """
-    # Focus on the TOP5 strips to avoid unrelated HUD hints.
+    if t is None:
+        return None
+    try:
+        v = float(t)
+    except Exception:
+        return None
+    # Discard implausible values
+    if v < 30.0:
+        return None
+    if v > 15360:
+        return None
+    return round(v, 2)
+
+
+def _preferred_langs_for_name_hint(name_hint: str) -> list[LanguageCode]:
+    """
+    Choose a minimal OCR language set likely to recognize the given name hint.
+
+    Purpose:
+      - Reduce compute by avoiding unnecessary multi-language OCR passes.
+      - Still include EN as a cheap fallback for digits/keywords.
+
+    Args:
+      name_hint:
+        - Provided name hint string.
+
+    Returns:
+      - List of language codes to try in order.
+
+    Notes:
+      - ASCII-like hints -> ["en"].
+      - CJK hints -> [best_guess_lang, "en"] where best_guess_lang is inferred via script profile.
+    """
+    """
+    Pick the cheapest OCR language set likely to recognize the name_hint.
+
+    Rules:
+    - ASCII -> ['en']
+    - CJK -> [best_guess_lang, 'en'] (en as a cheap fallback for digits/keywords)
+    """
+    if not name_hint:
+        return ["en"]
+
+    if count_cjk(name_hint) < 2:
+        return ["en"]
+
+    prof = build_script_profile(name_hint)
+    if prof.hangul >= max(prof.kana, prof.han):
+        primary: LanguageCode = "korean"
+    elif prof.kana >= prof.han:
+        primary = "japan"
+    else:
+        primary = "ch"
+
+    return [primary, "en"] if primary != "en" else ["en"]
+
+
+def extract_confirmed_time_from_banner(
+    banner_crop: np.ndarray,
+    cache: dict,
+    name_hint: str,
+) -> tuple[float | None, str, str | None]:
+    """
+    Extract a banner time only if the banner name matches the provided name hint (strict).
+
+    Purpose:
+      - Prevent using banner time when the banner belongs to a different player.
+      - Use strict name matching (>= HINT_MATCH_THRESHOLD) for hint-based flows.
+
+    Args:
+      banner_crop:
+        - Banner ROI image.
+      cache:
+        - Per-request OCR cache dict.
+      name_hint:
+        - Target player name to verify against banner name.
+
+    Returns:
+      - (time_seconds_or_none, banner_text, extracted_banner_name_or_none)
+
+    Notes:
+      - Tries a small ordered language set from `_preferred_langs_for_name_hint()`.
+      - OCRs both raw banner and its white mask for robustness.
+      - Only returns a non-None time when BOTH:
+        - a banner name is extracted, AND
+        - it matches the hint strictly, AND
+        - a valid time can be parsed and validated.
+      - When not confirmed, returns (None, last_text_seen, last_name_seen).
+    """
+    """
+    Return (time, banner_text, banner_name) ONLY IF banner_name matches name_hint.
+
+    This uses STRICT matching for name hints (default 90%).
+    """
+    if banner_crop is None or banner_crop.size == 0:
+        return None, "", None
+    name_hint = (name_hint or "").strip()
+    if not name_hint:
+        return None, "", None
+
+    banner_white = mask_white_regions(banner_crop)
+    langs = _preferred_langs_for_name_hint(name_hint)
+
+    all_lines: list[tuple[str, float]] = []
+    last_text = ""
+    last_name: str | None = None
+
+    for lang in langs:
+        lines: list[tuple[str, float]] = []
+        lines.extend(ocr_lines_cached(banner_crop, lang, cache))
+        if banner_white is not None:
+            lines.extend(ocr_lines_cached(banner_white, lang, cache))
+
+        all_lines.extend(lines)
+        text = normalize_banner_fragment(join_lines(all_lines))
+        last_text = text
+
+        nm = extract_name_from_banner(text)
+        last_name = nm
+
+        if nm and names_match_strict(nm, name_hint):
+            t = validate_time_seconds(extract_banner_time_seconds(text))
+            if t is not None:
+                return t, text, nm
+
+    return None, last_text, last_name
+
+
+def extract_top5_text(top_right_crop: np.ndarray, cache: dict) -> tuple[str, str]:
+    """
+    Extract OCR text from the TOP5 leaderboard area.
+
+    Purpose:
+      - Read the TOP5 block (names + times) without contamination from unrelated UI text.
+      - Provide a debug OCR line (optional) for troubleshooting.
+
+    Args:
+      top_right_crop:
+        - Full top-right ROI image.
+      cache:
+        - Per-request OCR cache dict.
+
+    Returns:
+      - (top5_text, dbg_full_text)
+        - top5_text: OCR text from TOP5 strips and variants.
+        - dbg_full_text: optional OCR of full top-right ROI (only when OCR_DEBUG_TEXTS is enabled).
+
+    Notes:
+      - Uses two strip ROIs to avoid "HOLD/LEADERBOARD" junk.
+      - Always runs EN OCR on strips; also adds limited Korean variants for CJK robustness.
+      - In non-FAST_OCR mode, may add Japan/Chinese variants if little CJK is detected.
+    """
+    """Extract TOP5 text and a debug OCR line."""
     if top_right_crop is None or top_right_crop.size == 0:
         return "", ""
 
+    tr0 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_0)
     tr1 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_1)
     tr2 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_2)
 
     top5_lines: list[tuple[str, float]] = []
-    for strip in (tr1, tr2):
+    for strip in (tr0, tr1, tr2):
         if strip is None or strip.size == 0:
             continue
 
-        top5_lines.extend(ocr_lines(strip, "en"))
+        top5_lines.extend(ocr_lines_cached(strip, "en", cache))
 
+        # Add a small set of CJK name variants for robustness.
         for v in build_cjk_name_variants(strip):
-            top5_lines.extend(ocr_lines(v, "korean"))
+            top5_lines.extend(ocr_lines_cached(v, "korean", cache))
 
         text_k = join_lines(top5_lines)
         if count_cjk(text_k) < 2 and not FAST_OCR:
             for v in build_cjk_name_variants(strip):
-                top5_lines.extend(ocr_lines(v, "japan"))
-                top5_lines.extend(ocr_lines(v, "ch"))
+                top5_lines.extend(ocr_lines_cached(v, "japan", cache))
+                top5_lines.extend(ocr_lines_cached(v, "ch", cache))
 
     top5_text = join_lines(top5_lines)
 
-    dbg_lines: list[tuple[str, float]] = []
-    dbg_lines.extend(ocr_lines(top_right_crop, "en"))
-    dbg_full = join_lines(dbg_lines)
+    dbg_full = ""
+    if OCR_DEBUG_TEXTS:
+        dbg_lines: list[tuple[str, float]] = []
+        dbg_lines.extend(ocr_lines_cached(top_right_crop, "en", cache))
+        dbg_full = join_lines(dbg_lines)
 
     return top5_text, dbg_full
 
 
+def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_similarity: float = 0.78) -> float | None:
+    """
+    Extract the target player's time from TOP5 leaderboard OCR text.
 
+    Purpose:
+      - Parse TOP5 entries (name + time) and select the time matching `target_name`.
+      - Support both ASCII and CJK name formats.
 
-def extract_time_from_top5(top5_text: str, bl_name: str | None) -> float | None:
-    """Extract the player time from the TOP5 leaderboard.
+    Args:
+      top5_text:
+        - OCR text extracted from TOP5 area.
+      target_name:
+        - Name to match against TOP5 entries.
+      min_similarity:
+        - Minimum similarity required to accept a match.
+        - Use HINT_MATCH_THRESHOLD (e.g., 0.90) for strict hint matching.
+
+    Returns:
+      - Time in seconds (float) if a match is found and parsed, else None.
+
+    Notes:
+      - Normalizes the TOP5 block starting at the "TOP5" header when present.
+      - Parses ASCII entries using an ASCII regex on uppercased text.
+      - Parses CJK entries using a CJK regex on the raw text.
+      - On ties, prefers earlier position in the text (more stable ordering).
+    """
+    """
+    Extract the player time from the TOP5 leaderboard.
 
     Args:
       top5_text: OCR text from TOP5 block.
-      bl_name: Bottom-left name.
+      target_name: Name to match.
+      min_similarity: Minimum similarity threshold. Use 0.90 for strict hint matching.
 
     Returns:
       Time in seconds or None.
     """
-    # Match times by name, falling back to similarity.
-    if not top5_text or not bl_name:
+    if not top5_text or not target_name:
         return None
 
-    upper_full = (top5_text or "").upper()
-    m_top5 = RE_TOP5_SECTION.search(upper_full)
-    block = upper_full[m_top5.start() :] if m_top5 else upper_full
-    block = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", block)
-
     def _to_float(s: str) -> float | None:
-        """Parse a numeric string to float safely.
+        """
+        Internal helper: convert a time token to float.
+
+        Purpose:
+          - Support comma or dot decimal separators.
 
         Args:
-          s: Numeric string.
+          s:
+            - String containing a numeric token.
 
         Returns:
-          Float or None.
+          - float value if parseable, else None.
         """
-        # Normalize decimal separators before parsing.
         try:
             return float((s or "").replace(",", "."))
         except Exception:
             return None
 
+    # Normalize and isolate TOP5 block
+    upper_full = (top5_text or "").upper()
+    m_top5 = RE_TOP5_SECTION.search(upper_full)
+    block_upper = upper_full[m_top5.start() :] if m_top5 else upper_full
+    block_upper = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", block_upper)
+
+    block_raw = top5_text
+    m2 = RE_TOP5_SECTION.search(block_raw)
+    block_raw = block_raw[m2.start() :] if m2 else block_raw
+    block_raw = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", block_raw)
+
     entries: list[tuple[int, str, float]] = []
 
-    for m in re.finditer(RE_TOP5_TIME_FOR_NAME_ASCII, block):
+    # ASCII entries
+    for m in re.finditer(RE_TOP5_TIME_FOR_NAME_ASCII, block_upper):
         nm = (m.group(1) or "").upper()
         nm = _strip_rank_prefix_ascii(nm)
         if not nm or nm in _GENERIC_ASCII:
@@ -1839,11 +2852,7 @@ def extract_time_from_top5(top5_text: str, bl_name: str | None) -> float | None:
             continue
         entries.append((m.start(), nm, t))
 
-    block_raw = top5_text
-    m2 = RE_TOP5_SECTION.search(block_raw)
-    block_raw = block_raw[m2.start() :] if m2 else block_raw
-    block_raw = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", block_raw)
-
+    # CJK entries
     for m in re.finditer(RE_TOP5_TIME_FOR_NAME_CJK, block_raw):
         nm = _cjk_best_substring(m.group(1) or "")
         if not nm or count_cjk(nm) < 2:
@@ -1856,45 +2865,173 @@ def extract_time_from_top5(top5_text: str, bl_name: str | None) -> float | None:
     if not entries:
         return None
 
-    entries.sort(key=lambda x: x[0])
-
-    if count_cjk(bl_name) >= 2:
-        target = remove_all_whitespace(bl_name)
-        best: tuple[int, float] | None = None
-        for pos, nm, t in entries:
-            if count_cjk(nm) < 2:
-                continue
-            cand = remove_all_whitespace(nm)
-            if cand == target or (len(target) >= 3 and (target in cand or cand in target)) or _sim(target, cand) >= 0.78:
-                if best is None or t > best[1] + 1e-2 or (abs(t - best[1]) <= 1e-2 and pos < best[0]):
-                    best = (pos, t)
-        return best[1] if best else None
-
-    target_vars = _name_variants_ascii(bl_name)
-    best_choice: tuple[int, int, float] | None = None
+    # Find best match by similarity
+    best: tuple[float, int, float] | None = None  # (sim, pos, time)
     for pos, nm, t in entries:
-        if count_cjk(nm) >= 2:
+        sim = name_similarity(nm, target_name)
+        if sim < min_similarity:
             continue
-        cand_vars = _name_variants_ascii(nm)
+        if best is None:
+            best = (sim, pos, t)
+            continue
+        # Prefer higher similarity; on tie prefer earlier position (more stable)
+        if sim > best[0] + 1e-6 or (abs(sim - best[0]) <= 1e-6 and pos < best[1]):
+            best = (sim, pos, t)
 
-        score = 0
-        if target_vars & cand_vars:
-            score = 3
-        else:
-            if any((cv in tv or tv in cv) and min(len(cv), len(tv)) >= 4 for tv in target_vars for cv in cand_vars):
-                score = 2
+    return best[2] if best else None
 
-        if score <= 0:
+
+def extract_confirmed_time_from_top5(
+    top_right_crop: np.ndarray,
+    cache: dict,
+    name_hint: str,
+) -> tuple[float | None, str, str]:
+    """
+    Extract a TOP5 time only if TOP5 contains the provided name hint (strict).
+
+    Purpose:
+      - Support hint-driven flow where we must not return another player's time.
+      - Use strict name matching threshold (>= HINT_MATCH_THRESHOLD) for validation.
+
+    Args:
+      top_right_crop:
+        - Top-right ROI image.
+      cache:
+        - Per-request OCR cache dict.
+      name_hint:
+        - Target player name hint.
+
+    Returns:
+      - (time_seconds_or_none, top5_text, dbg_full_text)
+
+    Notes:
+      - ASCII hints:
+        - Cheapest path: EN OCR over strip ROIs + white masks (+ optional grayscale in non-FAST_OCR).
+      - CJK hints:
+        - Uses `_preferred_langs_for_name_hint()` to select a primary language.
+        - Runs only a capped number of variants to limit CPU load.
+      - Debug full text is only returned when OCR_DEBUG_TEXTS is enabled.
+    """
+    """
+    Return (time, top5_text, dbg_full_text) ONLY IF TOP5 contains name_hint and a time.
+
+    This uses STRICT matching for name hints (default 90%).
+    """
+    if top_right_crop is None or top_right_crop.size == 0:
+        return None, "", ""
+
+    name_hint = (name_hint or "").strip()
+    if not name_hint:
+        return None, "", ""
+
+    tr0 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_0)
+    tr1 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_1)
+    tr2 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_2)
+
+    strips = (tr0, tr1, tr2)
+
+    lines: list[tuple[str, float]] = []
+
+    def _try_now() -> float | None:
+        """
+        Internal helper: attempt to parse a validated time for the current accumulated `lines`.
+
+        Purpose:
+          - Re-run parsing as we append more OCR lines to incrementally find a match.
+
+        Returns:
+          - Validated time (float) if found, else None.
+
+        Notes:
+          - Uses strict similarity threshold (HINT_MATCH_THRESHOLD) when calling `extract_time_from_top5`.
+        """
+        txt = join_lines(lines)
+        t = extract_time_from_top5(txt, name_hint, min_similarity=HINT_MATCH_THRESHOLD)
+        return validate_time_seconds(t)
+
+    # ASCII: cheapest path (EN only, optional masks)
+    if count_cjk(name_hint) < 2:
+        for strip in strips:
+            if strip is None or strip.size == 0:
+                continue
+
+            lines.extend(ocr_lines_cached(strip, "en", cache))
+
+            w = mask_white_regions(strip)
+            if w is not None:
+                lines.extend(ocr_lines_cached(w, "en", cache))
+
+            if not FAST_OCR:
+                g = enhance_contrast_grayscale(strip)
+                lines.extend(ocr_lines_cached(g, "en", cache))
+
+            t = _try_now()
+            if t is not None:
+                dbg_full = ""
+                if OCR_DEBUG_TEXTS:
+                    dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
+                return t, join_lines(lines), dbg_full
+
+        # Fallback: OCR the full top-right ROI (still safe because parsing starts at TOP5)
+        lines.extend(ocr_lines_cached(top_right_crop, "en", cache))
+        if not FAST_OCR:
+            g = enhance_contrast_grayscale(top_right_crop)
+            lines.extend(ocr_lines_cached(g, "en", cache))
+
+        t = _try_now()
+        dbg_full = ""
+        if OCR_DEBUG_TEXTS:
+            dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
+        return t, join_lines(lines), dbg_full
+
+    # CJK: targeted language, limited variants
+    langs = _preferred_langs_for_name_hint(name_hint)
+    primary = langs[0] if langs else "korean"
+
+    for strip in strips:
+        if strip is None or strip.size == 0:
             continue
 
-        if best_choice is None or score > best_choice[0] or (score == best_choice[0] and t > best_choice[2] + 1e-2):
-            best_choice = (score, pos, t)
+        variants = build_cjk_name_variants(strip)
+        max_v = 4 if FAST_OCR else 6  # hard cap to reduce load
+        for v in variants[:max_v]:
+            lines.extend(ocr_lines_cached(v, primary, cache))
 
-    return best_choice[2] if best_choice else None
+        t = _try_now()
+        if t is not None:
+            dbg_full = ""
+            if OCR_DEBUG_TEXTS:
+                dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
+            return t, join_lines(lines), dbg_full
+
+    # Optional EN fallback if primary didn't find it
+    if "en" in langs and primary != "en":
+        for strip in strips:
+            if strip is None or strip.size == 0:
+                continue
+            lines.extend(ocr_lines_cached(strip, "en", cache))
+            t = _try_now()
+            if t is not None:
+                dbg_full = ""
+                if OCR_DEBUG_TEXTS:
+                    dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
+                return t, join_lines(lines), dbg_full
+
+    # Fallback: OCR the full top-right ROI using primary language
+    variants_full = build_cjk_name_variants(top_right_crop)
+    max_v_full = 4 if FAST_OCR else 6
+    for v in variants_full[:max_v_full]:
+        lines.extend(ocr_lines_cached(v, primary, cache))
+
+    t = _try_now()
+    dbg_full = ""
+    if OCR_DEBUG_TEXTS:
+        dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
+    return t, join_lines(lines), dbg_full
 
 
 # =============================================================================
-# TIME: final selection (your decision tree)
+# TIME: final selection (decision tree)
 # =============================================================================
 def pick_final_time(
     bl_name: str | None,
@@ -1903,44 +3040,39 @@ def pick_final_time(
     top5_time: float | None,
     top_left_time: float | None,
 ) -> float | None:
-    """Pick the best time candidate using the decision tree.
+    """
+    Select the final time output using a simple decision tree.
+
+    Purpose:
+      - Combine multiple time candidates (banner, TOP5, top-left) and pick the most reliable.
+      - Prefer banner time only when the banner name matches the bottom-left name.
 
     Args:
-      bl_name: Bottom-left name.
-      banner_name: Banner name.
-      banner_time: Banner time candidate.
-      top5_time: TOP5 time candidate.
-      top_left_time: Top-left time candidate.
+      bl_name:
+        - Name extracted from bottom-left ROI (or None).
+      banner_name:
+        - Name extracted from banner OCR (or None).
+      banner_time:
+        - Time extracted from banner OCR (or None).
+      top5_time:
+        - Time extracted from TOP5 OCR (or None).
+      top_left_time:
+        - Time extracted from top-left OCR (or None).
 
     Returns:
-      Final time in seconds or None.
+      - Selected time (float seconds) or None.
+
+    Notes:
+      - Validates each candidate via `validate_time_seconds()` before selection.
+      - Priority:
+        1) banner time if names match and time valid
+        2) TOP5 time if valid
+        3) top-left time if valid
     """
-    # Validate and prioritize sources based on reliability.
-    def _valid(t: float | None) -> float | None:
-        """Validate and clamp a parsed time value.
-
-        Args:
-          t: Parsed time value.
-
-        Returns:
-          Validated time or None.
-        """
-        # Discard implausible values.
-        if t is None:
-            return None
-        try:
-            v = float(t)
-        except Exception:
-            return None
-        if v < 30.0:
-            return None
-        if v > 15360:
-            return None
-        return round(v, 2)
-
-    bt = _valid(banner_time)
-    t5 = _valid(top5_time)
-    tl = _valid(top_left_time)
+    """Pick the best time candidate using the decision tree."""
+    bt = validate_time_seconds(banner_time)
+    t5 = validate_time_seconds(top5_time)
+    tl = validate_time_seconds(top_left_time)
 
     if bl_name and banner_name and names_match(bl_name, banner_name) and bt is not None:
         return bt
@@ -1955,21 +3087,28 @@ def pick_final_time(
 # CODE extraction (top-left)
 # =============================================================================
 def normalize_map_code(raw_code_text: str | None, require_digit: bool = True) -> str | None:
-    """Normalize and validate a candidate map code string.
+    """
+    Normalize and validate a candidate map code.
 
-    Rules:
-    - 4-6 alphanumeric characters
-    - must contain at least one digit when required
-    - common HUD words and known non-codes are rejected
+    Purpose:
+      - Convert OCR output into a standardized code format.
+      - Reject common false positives (keywords, times, junk tokens).
 
     Args:
-      raw_code_text: Raw OCR string for a possible map code.
-      require_digit: Whether a digit is required.
+      raw_code_text:
+        - Raw candidate token that may contain a map code.
+      require_digit:
+        - Whether at least one digit must appear in the normalized code.
 
     Returns:
-      Cleaned map code if valid, otherwise None.
+      - Normalized code string (uppercase, O->0) if valid, else None.
+
+    Notes:
+      - Rejects known generic words and suspicious tokens.
+      - Enforces code length between 4 and 6.
+      - Uses `RE_BASIC_NORMALIZATION` to keep only A-Z0-9.
     """
-    # Early exits for empty or noisy inputs.
+    """Normalize and validate a candidate map code string."""
     if not raw_code_text:
         return None
 
@@ -2011,17 +3150,32 @@ def normalize_map_code(raw_code_text: str | None, require_digit: bool = True) ->
 
 
 def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_text: str) -> str | None:
-    """Extract the map code using heuristic passes.
+    """
+    Extract the map code from top-left OCR text using heuristic passes.
+
+    Purpose:
+      - Identify the map code in the "MAP CODE" HUD region.
+      - Handle formats with keywords, colons, and loose code-like tokens.
 
     Args:
-      top_left_text: OCR text from top-left.
-      top_left_white_text: OCR text from white mask.
-      top_left_cyan_text: OCR text from cyan mask.
+      top_left_text:
+        - OCR text from the top-left ROI.
+      top_left_white_text:
+        - OCR text from the top-left white mask.
+      top_left_cyan_text:
+        - OCR text from the top-left cyan mask.
 
     Returns:
-      Map code or None.
+      - Best candidate map code string, or None.
+
+    Notes:
+      - Pass order:
+        1) Keyword extraction (MAP CODE: XXXX)
+        2) Colon-based candidates (score by frequency and sanity)
+        3) Generic token scan (score by context window and letter/digit mix)
+      - Uses `normalize_map_code()` for validation.
     """
-    # Combine all OCR sources before matching.
+    """Extract the map code using heuristic passes."""
     all_text = " ".join([top_left_text or "", top_left_white_text or "", top_left_cyan_text or ""]).upper()
     normalized = re.sub(RE_MAP_CODE_NORMALIZATION, "MAP CODE", all_text)
 
@@ -2106,123 +3260,592 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
 
 
 # =============================================================================
-# OCR pipeline (sync)
+# Hint preference helpers (compare OCR vs provided)
 # =============================================================================
-def run_ocr_pipeline(img: np.ndarray) -> ApiResponse:
-    """Run the full OCR pipeline on a decoded image.
+def prefer_provided_code(extracted_code: str | None, provided_code: str | None) -> str | None:
+    """
+    Prefer the client's provided code only if it matches OCR strongly.
+
+    Purpose:
+      - Keep OCR as the source of truth, but allow hint override when it agrees.
+      - Optionally allow using hints as fallback when OCR fails (OCR_TRUST_HINTS).
 
     Args:
-      img: Decoded BGR image.
+      extracted_code:
+        - Code extracted from OCR (may be None).
+      provided_code:
+        - Code provided by the client (may be empty/None).
 
     Returns:
-      ApiResponse with extracted fields.
+      - The chosen code:
+        - provided_code if it matches extracted_code at >= HINT_MATCH_THRESHOLD
+        - otherwise extracted_code
+        - (optional) provided_code if OCR_TRUST_HINTS is enabled and extracted_code is missing
+
+    Notes:
+      - Normalizes provided_code using `normalize_map_code(require_digit=False)` for comparison.
+      - Similarity uses `code_similarity()` and the global threshold.
     """
-    # Measure end-to-end OCR time for diagnostics.
+    """
+    If provided_code matches extracted_code at >= 90%, return provided_code.
+    Otherwise return extracted_code (or provided_code only if OCR_TRUST_HINTS fallback is enabled).
+    """
+    provided_raw = (provided_code or "").strip()
+    if not provided_raw:
+        # No hint provided -> normal behavior
+        return extracted_code
+
+    provided = normalize_map_code(provided_raw, require_digit=False)
+    if not provided:
+        return None
+
+    # Require OCR extraction + strong match
+    if extracted_code and code_similarity(provided, extracted_code) >= HINT_MATCH_THRESHOLD:
+        return provided
+
+    return None
+
+
+def prefer_provided_time(extracted_time: float | None, provided_time: float | None) -> float | None:
+    """
+    Prefer the client's provided time only if it matches OCR strongly.
+
+    Purpose:
+      - Avoid trusting client-provided times unless OCR corroborates them.
+      - Optionally allow using provided time as a fallback when OCR fails (OCR_TRUST_HINTS).
+
+    Args:
+      extracted_time:
+        - Time extracted from OCR (may be None).
+      provided_time:
+        - Time provided by the client (may be 0/None).
+
+    Returns:
+      - The chosen time:
+        - provided_time (rounded) if it matches extracted_time at >= HINT_MATCH_THRESHOLD
+        - otherwise extracted_time
+        - (optional) provided_time if OCR_TRUST_HINTS enabled and extracted_time is missing
+
+    Notes:
+      - Validates returned hint fallback via `validate_time_seconds()` to avoid nonsense.
+      - Similarity uses `time_similarity()` and the global threshold.
+    """
+    """
+    If provided_time matches extracted_time at >= 90%, return provided_time.
+    Otherwise return extracted_time (or provided_time only if OCR_TRUST_HINTS fallback is enabled).
+    """
+    hint = None
+    try:
+        if provided_time and float(provided_time) > 0:
+            hint = float(provided_time)
+    except Exception:
+        hint = None
+
+    if hint is None:
+        return extracted_time
+
+    # Round the hint the same way as the output.
+    hint_rounded = round(hint, 2)
+
+    if extracted_time is not None and time_similarity(extracted_time, hint_rounded) >= HINT_MATCH_THRESHOLD:
+        return hint_rounded
+
+    if OCR_TRUST_HINTS and extracted_time is None:
+        # Still validate to avoid returning nonsense.
+        return validate_time_seconds(hint_rounded)
+
+    return extracted_time
+
+
+# =============================================================================
+# OCR pipeline (sync)
+# =============================================================================
+def run_ocr_pipeline(
+    img: np.ndarray,
+    *,
+    code: str,
+    time: float | None,
+    names: list[str],
+) -> dict:
+    """
+    Run the full OCR pipeline on a decoded screenshot.
+
+    Hint behavior:
+    - If code/time are provided, we STILL extract from OCR.
+    - If the OCR output matches the provided hint at >= 90%, we return the PROVIDED hint in the response.
+    - If name(s) are provided, we do NOT use bottom-left. We try:
+        1) Banner: if banner name matches (>=90%), return banner time
+        2) TOP5: if any entry name matches (>=90%), return that entry time
+
+      IMPORTANT (pair validation):
+      - If a time hint is provided (time > 0) together with names, the returned time is ONLY non-null
+        when BOTH the name is confirmed AND the OCR time matches the provided time (>= threshold).
+      - If (name confirmed) but time does NOT match the provided time -> return time = None.
+    """
     t0 = perf_counter()
+    cache: dict = {}
+
+    def _nonempty(s: str | None) -> str:
+        return (s or "").strip()
+
+    def _build_texts_payload(
+        *,
+        include_bottom_left: bool,
+        banner_text: str,
+        top5_text_in: str,
+        tr_full_in: str,
+    ) -> dict:
+        out: dict[str, object] = {}
+
+        tl_block: dict[str, str] = {}
+        if _nonempty(text_top_left_en):
+            tl_block["en"] = _nonempty(text_top_left_en)
+        if _nonempty(text_top_left_white_en):
+            tl_block["whiteMaskEn"] = _nonempty(text_top_left_white_en)
+        if _nonempty(text_top_left_cyan_en):
+            tl_block["cyanMaskEn"] = _nonempty(text_top_left_cyan_en)
+        if tl_block:
+            out["topLeft"] = tl_block
+
+        if include_bottom_left:
+            bl_txt = join_lines(ocr_lines_cached(bottom_left, "en", cache))
+            if _nonempty(bl_txt):
+                out["bottomLeft"] = {"en": _nonempty(bl_txt)}
+
+        if _nonempty(banner_text):
+            out["banner"] = {"text": _nonempty(banner_text)}
+
+        tr_block: dict[str, str] = {}
+        if _nonempty(top5_text_in):
+            tr_block["top5"] = _nonempty(top5_text_in)
+        if _nonempty(tr_full_in):
+            tr_block["fullEn"] = _nonempty(tr_full_in)
+        if tr_block:
+            out["topRight"] = tr_block
+
+        return out
+
+    def _normalize_code_hint(raw: str) -> str | None:
+        s = (raw or "").strip()
+        return normalize_map_code(s, require_digit=False) if s else None
+
+    def _normalize_time_hint(raw: float | None) -> float | None:
+        try:
+            if raw and float(raw) > 0:
+                return validate_time_seconds(round(float(raw), 2))
+        except Exception:
+            return None
+        return None
+
+    # Normalize name hints (keep order, drop empties, de-dup)
+    names_clean: list[str] = []
+    seen: set[str] = set()
+    for n in (names or []):
+        s = (n or "").strip()
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        names_clean.append(s)
+
+    use_names_flow = bool(names_clean)
+    primary_name_hint = names_clean[0] if names_clean else None
 
     # ---- crops ----
-    top_left = crop_by_frac_roi(img, ROI_TOPLEFT)
     top_left_wide = crop_by_frac_roi(img, ROI_TOPLEFT_WIDE)
     banner = crop_by_frac_roi(img, ROI_BANNER_TIGHT)
     top_right = crop_by_frac_roi(img, ROI_TOPRIGHT)
     bottom_left = crop_by_frac_roi(img, ROI_BOTTOMLEFT)
-    bottom_left_name = crop_by_frac_roi(img, ROI_BOTTOMLEFT)
+    bottom_left_name = bottom_left  # same ROI
 
-    # ---- TOP LEFT OCR (code + fallback time) ----
-    tl_lines = []
-    tl_lines.extend(ocr_lines(top_left, "en"))
-    tl_lines.extend(ocr_lines(top_left_wide, "en"))
+    # -------------------------------------------------------------------------
+    # TOP LEFT OCR (code only, minimal)
+    # -------------------------------------------------------------------------
+    text_top_left_en = ""
+    text_top_left_white_en = ""
+    text_top_left_cyan_en = ""
+
+    tl_lines: list[tuple[str, float]] = []
+    tl_lines.extend(ocr_lines_cached(top_left_wide, "en", cache))
     text_top_left_en = join_lines(tl_lines)
 
-    tl_white_mask = mask_white_regions(top_left_wide)
-    tl_cyan_mask = mask_cyan_regions(top_left_wide)
-    text_top_left_white_en = join_lines(ocr_lines(tl_white_mask, "en")) if tl_white_mask is not None else ""
-    text_top_left_cyan_en = join_lines(ocr_lines(tl_cyan_mask, "en")) if tl_cyan_mask is not None else ""
+    # Quick code attempt WITHOUT masks (cheap).
+    map_code = extract_code(text_top_left_en, "", "")
+    if map_code is None:
+        # Only do masks if needed for code
+        tl_white_mask = mask_white_regions(top_left_wide)
+        tl_cyan_mask = mask_cyan_regions(top_left_wide)
+        text_top_left_white_en = join_lines(ocr_lines_cached(tl_white_mask, "en", cache)) if tl_white_mask is not None else ""
+        text_top_left_cyan_en = join_lines(ocr_lines_cached(tl_cyan_mask, "en", cache)) if tl_cyan_mask is not None else ""
+        map_code = extract_code(text_top_left_en, text_top_left_white_en, text_top_left_cyan_en)
 
-    code = extract_code(text_top_left_en, text_top_left_white_en, text_top_left_cyan_en)
+    # Apply code hint preference (compare OCR vs provided)
+    map_code_final = prefer_provided_code(map_code, code)
 
-    # ---- BL debug + name (source of truth) ----
-    bl_debug = join_lines(ocr_lines(bottom_left, "en"))
-    bl_name_raw = extract_name_from_bottom_left(bottom_left_name, bottom_left)
+    code_hint_norm = _normalize_code_hint(code)
+    code_source = None
+    code_verified_by = None
 
-    # ---- TOP5 OCR (needed for rank-prefix normalization + timing) ----
-    top5_text, tr_debug_full = extract_top5_text(top_right)
+    if (code_hint_norm or "").strip():
+        # Hint was provided: we only return code if it matched OCR
+        if map_code_final is not None:
+            code_source = "hint"
+            code_verified_by = "topLeft"
+        else:
+            # hint present but not confirmed by OCR
+            # (either OCR couldn't extract, or mismatch)
+            code_source = "hintMismatch" if map_code is not None else "hintUnconfirmed"
+    else:
+        # No hint provided: normal OCR behavior
+        if map_code_final:
+            code_source = "topLeft"
 
-    # FIX: if BL name contains rank prefix, prefer the stripped version ONLY if TOP5 confirms it
-    bl_name = bl_name_raw
-    if bl_name and count_cjk(bl_name) == 0:
-        bl_name = _strip_rank_prefix_ascii_with_top5_hint(bl_name, top5_text)
+    # -------------------------------------------------------------------------
+    # FLOW A: name(s) provided -> Banner (strict) then TOP5 (strict)
+    #   + If time hint is provided, time must match ABSOLUTELY (via time_similarity/HINT_TIME_ABS_TOL)
+    #   + If name is confirmed but time doesn't match -> return time = None (but keep the name)
+    # -------------------------------------------------------------------------
+    if use_names_flow:
+        names_to_try = names_clean[:5]
 
-    # ---- Banner OCR ----
-    banner_white = mask_white_regions(banner)
-    banner_gray = enhance_contrast_grayscale(banner)
-    banner_binary = cv2.adaptiveThreshold(
-        banner_gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        9,
-    )
+        # Parse + validate provided time hint (if any)
+        time_hint_valid = _normalize_time_hint(time)
 
-    banner_lines = []
-    banner_lines.extend(ocr_lines(banner, "en"))
-    banner_lines.extend(ocr_lines(banner_white, "en"))
-    banner_lines.extend(ocr_lines(banner_binary, "en"))
-    banner_lines.extend(ocr_lines(banner, "korean"))
-    banner_lines.extend(ocr_lines(banner_white, "korean"))
-    banner_lines.extend(ocr_lines(banner_binary, "korean"))
-    banner_lines.extend(ocr_lines(banner_gray, "korean"))
-    if not FAST_OCR:
-        banner_lines.extend(ocr_lines(banner, "japan"))
-        banner_lines.extend(ocr_lines(banner, "ch"))
-    text_banner = normalize_banner_fragment(join_lines(banner_lines))
+        picked_name: str | None = None
+        seconds: float | None = None
 
-    banner_name = extract_name_from_banner(text_banner)
-    banner_time = extract_banner_time_seconds(text_banner)
+        # Track first confirmed name (even if time mismatch), so we can return name with time=None.
+        first_confirmed_name: str | None = None
 
-    # ---- TOP5 time for that name ----
-    top5_time = extract_time_from_top5(top5_text, bl_name)
+        text_banner = ""
+        banner_name = None
 
-    # ---- Top-left fallback ----
+        top5_text = ""
+        tr_debug_full = ""
+
+        time_source = None
+        time_verified_by = None
+
+        def _time_hint_matches(ocr_time: float | None) -> bool:
+            """
+            Return True if provided time hint matches the OCR time with strict ABS tolerance.
+            """
+            if time_hint_valid is None:
+                return True  # no hint -> not a constraint
+            if ocr_time is None:
+                return False
+            return time_similarity(ocr_time, time_hint_valid) >= HINT_MATCH_THRESHOLD
+
+        for name_hint in names_to_try:
+            # 1) Banner-confirmed time first (name is STRICTLY confirmed inside)
+            banner_time_confirmed, text_banner, banner_name = extract_confirmed_time_from_banner(
+                banner,
+                cache,
+                name_hint=name_hint,
+            )
+            if banner_time_confirmed is not None:
+                # Name is confirmed here.
+                if first_confirmed_name is None:
+                    first_confirmed_name = name_hint
+
+                # If a time hint is provided, it MUST match. Otherwise we keep searching other names.
+                if _time_hint_matches(banner_time_confirmed):
+                    picked_name = name_hint
+                    if time_hint_valid is not None:
+                        seconds = time_hint_valid
+                        time_source = "hint"
+                        time_verified_by = "banner"
+                    else:
+                        seconds = validate_time_seconds(banner_time_confirmed)
+                        time_source = "banner"
+                    break
+                # else: mismatch -> keep searching for another (name,time) pair
+
+            # 2) TOP5-confirmed time (name is STRICTLY matched inside parsing)
+            top5_time_confirmed, top5_text, tr_debug_full = extract_confirmed_time_from_top5(
+                top_right,
+                cache,
+                name_hint=name_hint,
+            )
+            if top5_time_confirmed is not None:
+                if first_confirmed_name is None:
+                    first_confirmed_name = name_hint
+
+                if _time_hint_matches(top5_time_confirmed):
+                    picked_name = name_hint
+                    if time_hint_valid is not None:
+                        seconds = time_hint_valid
+                        time_source = "hint"
+                        time_verified_by = "topRight.top5"
+                    else:
+                        seconds = validate_time_seconds(top5_time_confirmed)
+                        time_source = "topRight.top5"
+                    break
+
+        # If a time hint was provided but no (name,time) pair matched it:
+        # - If we at least confirmed a name, return that name with time=None.
+        # - Otherwise return (None, None).
+        if time_hint_valid is not None and seconds is None:
+            picked_name = first_confirmed_name
+            seconds = None
+            time_source = "unconfirmed"
+
+        texts_payload = _build_texts_payload(
+            include_bottom_left=False,
+            banner_text=text_banner,
+            top5_text_in=top5_text,
+            tr_full_in=(tr_debug_full if OCR_DEBUG_TEXTS else ""),
+        )
+
+        sources: dict[str, object] = {
+            "name": "hint",
+            "code": code_source,
+            "time": time_source,
+        }
+        if code_verified_by:
+            sources["codeVerifiedBy"] = code_verified_by
+        if time_verified_by:
+            sources["timeVerifiedBy"] = time_verified_by
+
+        elapsed = perf_counter() - t0
+        logger.info(f"[ocr] names-flow t={elapsed:.2f}s fast={FAST_OCR}")
+        return {
+            "extracted": {
+                "name": picked_name,
+                "time": seconds,
+                "code": map_code_final,
+                "sources": sources,
+                "texts": texts_payload,
+            }
+        }
+
+    # -------------------------------------------------------------------------
+    # FLOW B: normal flow (bottom-left name, then TL/top5/banner decision tree)
+    # -------------------------------------------------------------------------
+
+    # ---- TL time ----
+    if not text_top_left_white_en:
+        tl_white_mask = mask_white_regions(top_left_wide)
+        text_top_left_white_en = join_lines(ocr_lines_cached(tl_white_mask, "en", cache)) if tl_white_mask is not None else ""
     top_left_time = extract_time_from_top_left(text_top_left_en, text_top_left_white_en)
 
-    seconds = pick_final_time(
+    # ---- NAME (BL) ----
+    bl_name = extract_name_from_bottom_left(
+        bottom_left_name,
+        bottom_left,
+        cache=cache,
+        name_hint=primary_name_hint,
+    )
+
+    # ---- EARLY EXIT (fast path) ----
+    if OCR_EARLY_EXIT and not ACCURATE_OCR and bl_name and map_code_final and top_left_time is not None:
+        seconds_ocr = pick_final_time(
+            bl_name=bl_name,
+            banner_name=None,
+            banner_time=None,
+            top5_time=None,
+            top_left_time=top_left_time,
+        )
+        seconds_ocr = validate_time_seconds(seconds_ocr)
+        seconds = prefer_provided_time(seconds_ocr, time)
+
+        time_source = "topLeft" if seconds_ocr is not None else None
+        time_hint_valid = _normalize_time_hint(time)
+        time_verified_by = None
+        if time_hint_valid is not None:
+            if seconds_ocr is None and OCR_TRUST_HINTS and seconds == time_hint_valid:
+                time_source = "hint"
+            elif seconds_ocr is not None and time_similarity(seconds_ocr, time_hint_valid) >= HINT_MATCH_THRESHOLD:
+                time_source = "hint"
+                time_verified_by = "topLeft"
+
+        texts_payload = _build_texts_payload(
+            include_bottom_left=True,
+            banner_text="",
+            top5_text_in="",
+            tr_full_in="",
+        )
+
+        sources: dict[str, object] = {
+            "name": "bottomLeft",
+            "code": code_source,
+            "time": time_source,
+        }
+        if code_verified_by:
+            sources["codeVerifiedBy"] = code_verified_by
+        if time_verified_by:
+            sources["timeVerifiedBy"] = time_verified_by
+
+        elapsed = perf_counter() - t0
+        logger.info(f"[ocr] fast-exit t={elapsed:.2f}s fast={FAST_OCR}")
+        return {
+            "extracted": {
+                "name": bl_name,
+                "time": seconds,
+                "code": map_code_final,
+                "sources": sources,
+                "texts": texts_payload,
+            }
+        }
+
+    # ---- TOP5 (only if time is missing or accurate mode) ----
+    top5_text = ""
+    tr_debug_full = ""
+    top5_time = None
+    if (top_left_time is None or ACCURATE_OCR) and bl_name:
+        top5_text, tr_debug_full = extract_top5_text(top_right, cache)
+        if bl_name and count_cjk(bl_name) == 0:
+            bl_name = _strip_rank_prefix_ascii_with_top5_hint(bl_name, top5_text)
+        top5_time = extract_time_from_top5(top5_text, bl_name, min_similarity=0.78)
+
+        if OCR_EARLY_EXIT and not ACCURATE_OCR and map_code_final and bl_name and top5_time is not None:
+            seconds_ocr = pick_final_time(
+                bl_name=bl_name,
+                banner_name=None,
+                banner_time=None,
+                top5_time=top5_time,
+                top_left_time=top_left_time,
+            )
+            seconds_ocr = validate_time_seconds(seconds_ocr)
+            seconds = prefer_provided_time(seconds_ocr, time)
+
+            time_source = "topRight.top5" if seconds_ocr is not None else None
+            time_hint_valid = _normalize_time_hint(time)
+            time_verified_by = None
+            if time_hint_valid is not None:
+                if seconds_ocr is None and OCR_TRUST_HINTS and seconds == time_hint_valid:
+                    time_source = "hint"
+                elif seconds_ocr is not None and time_similarity(seconds_ocr, time_hint_valid) >= HINT_MATCH_THRESHOLD:
+                    time_source = "hint"
+                    time_verified_by = "topRight.top5"
+
+            texts_payload = _build_texts_payload(
+                include_bottom_left=True,
+                banner_text="",
+                top5_text_in=top5_text,
+                tr_full_in=(tr_debug_full if OCR_DEBUG_TEXTS else ""),
+            )
+
+            sources: dict[str, object] = {
+                "name": "bottomLeft",
+                "code": code_source,
+                "time": time_source,
+            }
+            if code_verified_by:
+                sources["codeVerifiedBy"] = code_verified_by
+            if time_verified_by:
+                sources["timeVerifiedBy"] = time_verified_by
+
+            elapsed = perf_counter() - t0
+            logger.info(f"[ocr] top5-exit t={elapsed:.2f}s fast={FAST_OCR}")
+            return {
+                "extracted": {
+                    "name": bl_name,
+                    "time": seconds,
+                    "code": map_code_final,
+                    "sources": sources,
+                    "texts": texts_payload,
+                }
+            }
+
+    # ---- BANNER (only if still missing time OR accurate mode) ----
+    text_banner = ""
+    banner_name = None
+    banner_time = None
+
+    if (top_left_time is None and top5_time is None) or ACCURATE_OCR:
+        banner_lines: list[tuple[str, float]] = []
+        banner_lines.extend(ocr_lines_cached(banner, "en", cache))
+
+        banner_white = mask_white_regions(banner)
+        banner_lines.extend(ocr_lines_cached(banner_white, "en", cache))
+
+        text_banner = normalize_banner_fragment(join_lines(banner_lines))
+        banner_name = extract_name_from_banner(text_banner)
+        banner_time = extract_banner_time_seconds(text_banner)
+
+        if (banner_time is None or (bl_name and banner_name and not names_match(bl_name, banner_name))) and not FAST_OCR:
+            banner_gray = enhance_contrast_grayscale(banner)
+            banner_binary = cv2.adaptiveThreshold(
+                banner_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9
+            )
+
+            extra: list[tuple[str, float]] = []
+            extra.extend(ocr_lines_cached(banner_binary, "en", cache))
+            extra.extend(ocr_lines_cached(banner, "korean", cache))
+            extra.extend(ocr_lines_cached(banner_white, "korean", cache))
+            extra.extend(ocr_lines_cached(banner_binary, "korean", cache))
+
+            if count_cjk(bl_name or "") >= 2:
+                extra.extend(ocr_lines_cached(banner, "japan", cache))
+                extra.extend(ocr_lines_cached(banner, "ch", cache))
+
+            text_banner = normalize_banner_fragment(join_lines(banner_lines + extra))
+            banner_name = extract_name_from_banner(text_banner)
+            banner_time = extract_banner_time_seconds(text_banner)
+
+    # ---- Final time decision tree ----
+    seconds_ocr = pick_final_time(
         bl_name=bl_name,
         banner_name=banner_name,
         banner_time=banner_time,
         top5_time=top5_time,
         top_left_time=top_left_time,
     )
+    seconds_ocr = validate_time_seconds(seconds_ocr)
+    seconds = prefer_provided_time(seconds_ocr, time)
 
-    # ---- Name is always sourced from bottom-left ----
-    final_name = bl_name
+    time_source = None
+    if seconds_ocr is not None:
+        bt = validate_time_seconds(banner_time)
+        t5 = validate_time_seconds(top5_time)
+        tl = validate_time_seconds(top_left_time)
 
-    top_right_debug = ""
-    if tr_debug_full:
-        top_right_debug += f"FULL: {tr_debug_full} "
-    if top5_text:
-        top_right_debug += f"TOP5: {top5_text}"
-    top_right_debug = top_right_debug.strip()
+        if bl_name and banner_name and names_match(bl_name, banner_name) and bt is not None and seconds_ocr == bt:
+            time_source = "banner"
+        elif t5 is not None and seconds_ocr == t5:
+            time_source = "topRight.top5"
+        elif tl is not None and seconds_ocr == tl:
+            time_source = "topLeft"
+
+    time_hint_valid = _normalize_time_hint(time)
+    time_verified_by = None
+    if time_hint_valid is not None:
+        if seconds_ocr is None and OCR_TRUST_HINTS and seconds == time_hint_valid:
+            time_source = "hint"
+        elif seconds_ocr is not None and time_similarity(seconds_ocr, time_hint_valid) >= HINT_MATCH_THRESHOLD:
+            time_verified_by = time_source
+            time_source = "hint"
+
+    texts_payload = _build_texts_payload(
+        include_bottom_left=True,
+        banner_text=text_banner,
+        top5_text_in=top5_text,
+        tr_full_in=(tr_debug_full if OCR_DEBUG_TEXTS else ""),
+    )
+
+    sources: dict[str, object] = {
+        "name": "bottomLeft" if bl_name else None,
+        "code": code_source,
+        "time": time_source,
+    }
+    if code_verified_by:
+        sources["codeVerifiedBy"] = code_verified_by
+    if time_verified_by:
+        sources["timeVerifiedBy"] = time_verified_by
 
     elapsed = perf_counter() - t0
     logger.info(f"[ocr] done t={elapsed:.2f}s fast={FAST_OCR}")
-
-    return ApiResponse(
-        extracted=ExtractedResult(
-            name=final_name,
-            time=seconds,
-            code=code,
-            texts=ExtractedTexts(
-                top_left=text_top_left_en,
-                top_left_white=text_top_left_white_en,
-                top_left_cyan=text_top_left_cyan_en,
-                banner=text_banner,
-                top_right=top_right_debug,
-                bottom_left=bl_debug,
-            ),
-        )
-    )
+    return {
+        "extracted": {
+            "name": bl_name,
+            "time": seconds,
+            "code": map_code_final,
+            "sources": sources,
+            "texts": texts_payload,
+        }
+    }
 
 
 # =============================================================================
@@ -2234,9 +3857,31 @@ class _OcrJob:
     url: str
     fut: "asyncio.Future[ApiResponse]"
     enqueued_at: float
+    code: str
+    time: float | None
+    names: list[str]
 
 
 async def _ocr_worker(app: FastAPI) -> None:
+    """
+    Process OCR jobs sequentially from a FIFO queue.
+
+    Purpose:
+      - Serialize PaddleOCR inference to avoid oneDNN/MKLDNN concurrency crashes.
+      - Provide backpressure behavior via queue size + wait timeouts.
+
+    Args:
+      app:
+        - FastAPI application instance containing `state.ocr_queue`.
+
+    Returns:
+      - None (runs forever until cancelled).
+
+    Notes:
+      - Each job runs `run_ocr_pipeline()` inside `asyncio.to_thread()` to keep the event loop responsive.
+      - Even though inference runs in a worker thread, jobs are strictly sequential due to single worker.
+      - Sets result/exception on the job future unless cancelled.
+    """
     """
     Single FIFO worker that runs PaddleOCR inference sequentially.
     This avoids oneDNN/MKLDNN concurrency crashes.
@@ -2255,7 +3900,13 @@ async def _ocr_worker(app: FastAPI) -> None:
 
             # Run the heavy OCR pipeline in a thread (still sequential thanks to the queue)
             res = await asyncio.wait_for(
-                asyncio.to_thread(run_ocr_pipeline, job.img),
+                asyncio.to_thread(
+                    run_ocr_pipeline,
+                    job.img,
+                    code=job.code,
+                    time=job.time,
+                    names=job.names,
+                ),
                 timeout=OCR_TIMEOUT_S,
             )
 
@@ -2275,42 +3926,108 @@ async def _ocr_worker(app: FastAPI) -> None:
             q.task_done()
 
 
-async def _enqueue_ocr(app: FastAPI, img: np.ndarray, url: str) -> ApiResponse:
+async def _enqueue_ocr(
+    app: FastAPI,
+    img: np.ndarray,
+    url: str,
+    *,
+    code: str,
+    time: float,
+    names: list[str],
+) -> ApiResponse:
+    """
+    Enqueue an OCR job and await its completion.
+
+    Purpose:
+      - Provide a single async entrypoint for the API handler to schedule OCR work.
+      - Apply queue capacity constraints and overall wait+run timeouts.
+
+    Args:
+      app:
+        - FastAPI application instance with `state.ocr_queue`.
+      img:
+        - Decoded screenshot as OpenCV BGR ndarray.
+      url:
+        - Source image URL (for logging/observability).
+      code:
+        - Optional code hint.
+      time:
+        - Optional time hint.
+      names:
+        - Optional name hints list.
+
+    Returns:
+      - ApiResponse from `run_ocr_pipeline()`.
+
+    Raises:
+      - HTTPException(429) if queue is full (when OCR_QUEUE_MAXSIZE > 0).
+      - asyncio.TimeoutError if the job exceeds (queue wait + OCR run) deadline.
+
+    Notes:
+      - Creates a Future bound to the current event loop and hands it to the worker via _OcrJob.
+      - Cancels the future on wait timeout to allow the worker to skip completed work if possible.
+    """
+    """Enqueue an OCR job and wait for the result."""
     q: asyncio.Queue[_OcrJob] = app.state.ocr_queue
     loop = asyncio.get_running_loop()
     fut: asyncio.Future[ApiResponse] = loop.create_future()
 
-    # Optional backpressure
     if OCR_QUEUE_MAXSIZE > 0 and q.full():
         raise HTTPException(status_code=429, detail="OCR busy (queue full). Try again later.")
 
-    await q.put(_OcrJob(img=img, url=url, fut=fut, enqueued_at=perf_counter()))
+    await q.put(
+        _OcrJob(
+            img=img,
+            url=url,
+            fut=fut,
+            enqueued_at=perf_counter(),
+            code=code,
+            time=time,
+            names=names,
+        )
+    )
 
     try:
-        # Total wait = queue wait + execution time
         return await asyncio.wait_for(fut, timeout=OCR_QUEUE_WAIT_S + OCR_TIMEOUT_S)
     except asyncio.TimeoutError:
         fut.cancel()
         raise
 
+
 class ImageURLPayload(BaseModel):
     image_url: HttpUrl
+    code: str = ""
+    time: float | None = None
+    names: list[str] = Field(default_factory=list)
 
 
 @asynccontextmanager
 async def warm_models_on_startup(app: FastAPI) -> AsyncIterator:
-    """Warm models and create the HTTP session on startup.
+    """
+    FastAPI lifespan handler: warm models and prepare shared resources.
+
+    Purpose:
+      - Load PaddleOCR models at startup.
+      - Initialize a shared aiohttp session for image fetching.
+      - Create the OCR FIFO queue and start the single worker task.
 
     Args:
-      app: FastAPI application.
+      app:
+        - FastAPI app instance.
 
-    Returns:
-      Async iterator for lifespan.
+    Yields:
+      - Control back to FastAPI after startup is complete.
+
+    Notes:
+      - On shutdown:
+        - Cancels the worker task and awaits it safely.
+        - Closes the aiohttp session.
+      - Queue maxsize uses OCR_QUEUE_MAXSIZE (0 means unlimited per asyncio semantics here).
     """
-    # Load models once and reuse the shared HTTP client.
+    """Warm models and create the HTTP session on startup."""
     log_model_dirs()
     warm_ocr_engines()
-    # Set a sane timeout to avoid hanging on slow or blocked URLs.
+
     timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=15)
     app.state.http_session = aiohttp.ClientSession(timeout=timeout)
 
@@ -2335,35 +4052,61 @@ app = FastAPI(title="GenjiPK OCR", lifespan=warm_models_on_startup)
 
 @app.get("/ping")
 def ping() -> dict:
-    """Health check endpoint for warmed models.
+    """
+    Health-check endpoint.
 
-    Args:
-      None.
+    Purpose:
+      - Verify the service is running and models are loaded.
+      - Provide a quick view of warmed language engines.
 
     Returns:
-      Status payload with model list.
+      - Dict with:
+        - ok: True
+        - models: sorted list of loaded language keys
+
+    Notes:
+      - This endpoint does not perform OCR; it only reports readiness.
     """
-    # Return model list for quick diagnostics.
+    """Health check endpoint for warmed models."""
     return {"ok": True, "models": sorted(OCR_ENGINES.keys())}
 
 
 @app.post("/extract", response_model=ApiResponse)
-async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiResponse:
-    """Extract name, time, and code from an image URL payload.
+async def extract_ocr_data(payload: ImageURLPayload, request: Request):
+    """
+    Main API endpoint: fetch an image by URL and run OCR extraction.
+
+    Purpose:
+      - Download the screenshot from `payload.image_url`.
+      - Decode into an OpenCV image.
+      - Enqueue the OCR job and return the extracted results.
 
     Args:
-      payload: Request payload with image URL.
-      request: FastAPI request object.
+      payload:
+        - Request body containing:
+          - image_url: URL to fetch
+          - code/time/names: optional hints
+      request:
+        - FastAPI request object (used to access app state).
 
     Returns:
-      ApiResponse containing extracted data.
+      - ApiResponse containing extracted fields.
+
+    Raises:
+      - HTTPException(503) if models are not ready.
+      - HTTPException(400/408/500) for fetch/decode failures.
+      - HTTPException(504) if OCR exceeds queue+run timeout.
+
+    Notes:
+      - Uses a shared aiohttp session stored in app.state for connection pooling.
+      - Image fetch logs include byte size and elapsed time for observability.
+      - OCR work is serialized by the internal queue/worker to avoid concurrency crashes.
     """
-    # Ensure models are warm before processing requests.
+    """Extract name, time, and code from an image URL payload."""
     if "en" not in OCR_ENGINES:
         raise HTTPException(status_code=503, detail="OCR models not ready yet")
 
     try:
-        # Fetch the image from the provided URL.
         session = request.app.state.http_session
         image_url = str(payload.image_url)
         t0 = perf_counter()
@@ -2382,10 +4125,19 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
         raise HTTPException(status_code=500, detail=f"unexpected error: {e}")
 
     try:
-        return await _enqueue_ocr(request.app, img, image_url)
+        res = await _enqueue_ocr(
+            request.app,
+            img,
+            image_url,
+            code=payload.code,
+            time=payload.time,
+            names=payload.names,
+        )
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(content=res)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="ocr timeout (queue + run)")
-
 
 
 if __name__ == "__main__":
