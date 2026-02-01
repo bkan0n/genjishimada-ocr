@@ -247,6 +247,7 @@ ROI_TOPRIGHT = [0.821, 0.077, 0.985, 0.565]
 ROI_BOTTOMLEFT = [0.050, 0.825, 0.330, 0.990]
 
 # TOP5 strip inside ROI_TOPRIGHT (to avoid "HOLD ... LEADERBOARD" junk)
+ROI_TR_TOP5_STRIP_0 = [0.02, 0.18, 1.00, 0.62]
 ROI_TR_TOP5_STRIP_1 = [0.22, 0.50, 1.00, 0.78]
 ROI_TR_TOP5_STRIP_2 = [0.16, 0.48, 1.00, 0.82]
 
@@ -2736,11 +2737,12 @@ def extract_top5_text(top_right_crop: np.ndarray, cache: dict) -> tuple[str, str
     if top_right_crop is None or top_right_crop.size == 0:
         return "", ""
 
+    tr0 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_0)
     tr1 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_1)
     tr2 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_2)
 
     top5_lines: list[tuple[str, float]] = []
-    for strip in (tr1, tr2):
+    for strip in (tr0, tr1, tr2):
         if strip is None or strip.size == 0:
             continue
 
@@ -2922,8 +2924,11 @@ def extract_confirmed_time_from_top5(
     if not name_hint:
         return None, "", ""
 
+    tr0 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_0)
     tr1 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_1)
     tr2 = crop_within(top_right_crop, ROI_TR_TOP5_STRIP_2)
+
+    strips = (tr0, tr1, tr2)
 
     lines: list[tuple[str, float]] = []
 
@@ -2946,7 +2951,7 @@ def extract_confirmed_time_from_top5(
 
     # ASCII: cheapest path (EN only, optional masks)
     if count_cjk(name_hint) < 2:
-        for strip in (tr1, tr2):
+        for strip in strips:
             if strip is None or strip.size == 0:
                 continue
 
@@ -2967,16 +2972,23 @@ def extract_confirmed_time_from_top5(
                     dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
                 return t, join_lines(lines), dbg_full
 
+        # Fallback: OCR the full top-right ROI (still safe because parsing starts at TOP5)
+        lines.extend(ocr_lines_cached(top_right_crop, "en", cache))
+        if not FAST_OCR:
+            g = enhance_contrast_grayscale(top_right_crop)
+            lines.extend(ocr_lines_cached(g, "en", cache))
+
+        t = _try_now()
         dbg_full = ""
         if OCR_DEBUG_TEXTS:
             dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
-        return None, join_lines(lines), dbg_full
+        return t, join_lines(lines), dbg_full
 
     # CJK: targeted language, limited variants
     langs = _preferred_langs_for_name_hint(name_hint)
     primary = langs[0] if langs else "korean"
 
-    for strip in (tr1, tr2):
+    for strip in strips:
         if strip is None or strip.size == 0:
             continue
 
@@ -2994,7 +3006,7 @@ def extract_confirmed_time_from_top5(
 
     # Optional EN fallback if primary didn't find it
     if "en" in langs and primary != "en":
-        for strip in (tr1, tr2):
+        for strip in strips:
             if strip is None or strip.size == 0:
                 continue
             lines.extend(ocr_lines_cached(strip, "en", cache))
@@ -3005,10 +3017,17 @@ def extract_confirmed_time_from_top5(
                     dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
                 return t, join_lines(lines), dbg_full
 
+    # Fallback: OCR the full top-right ROI using primary language
+    variants_full = build_cjk_name_variants(top_right_crop)
+    max_v_full = 4 if FAST_OCR else 6
+    for v in variants_full[:max_v_full]:
+        lines.extend(ocr_lines_cached(v, primary, cache))
+
+    t = _try_now()
     dbg_full = ""
     if OCR_DEBUG_TEXTS:
         dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
-    return None, join_lines(lines), dbg_full
+    return t, join_lines(lines), dbg_full
 
 
 # =============================================================================
