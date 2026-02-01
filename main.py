@@ -2587,7 +2587,7 @@ def validate_time_seconds(t: float | None) -> float | None:
         v = float(t)
     except Exception:
         return None
-    # Discard implausible values (keep your existing constraints)
+    # Discard implausible values
     if v < 30.0:
         return None
     if v > 15360:
@@ -3364,7 +3364,7 @@ def run_ocr_pipeline(
     code: str,
     time: float | None,
     names: list[str],
-) -> ApiResponse:
+) -> dict:
     """
     Run the full OCR pipeline on a decoded screenshot.
 
@@ -3382,6 +3382,58 @@ def run_ocr_pipeline(
     """
     t0 = perf_counter()
     cache: dict = {}
+
+    def _nonempty(s: str | None) -> str:
+        return (s or "").strip()
+
+    def _build_texts_payload(
+        *,
+        include_bottom_left: bool,
+        banner_text: str,
+        top5_text_in: str,
+        tr_full_in: str,
+    ) -> dict:
+        out: dict[str, object] = {}
+
+        tl_block: dict[str, str] = {}
+        if _nonempty(text_top_left_en):
+            tl_block["en"] = _nonempty(text_top_left_en)
+        if _nonempty(text_top_left_white_en):
+            tl_block["whiteMaskEn"] = _nonempty(text_top_left_white_en)
+        if _nonempty(text_top_left_cyan_en):
+            tl_block["cyanMaskEn"] = _nonempty(text_top_left_cyan_en)
+        if tl_block:
+            out["topLeft"] = tl_block
+
+        if include_bottom_left:
+            bl_txt = join_lines(ocr_lines_cached(bottom_left, "en", cache))
+            if _nonempty(bl_txt):
+                out["bottomLeft"] = {"en": _nonempty(bl_txt)}
+
+        if _nonempty(banner_text):
+            out["banner"] = {"text": _nonempty(banner_text)}
+
+        tr_block: dict[str, str] = {}
+        if _nonempty(top5_text_in):
+            tr_block["top5"] = _nonempty(top5_text_in)
+        if _nonempty(tr_full_in):
+            tr_block["fullEn"] = _nonempty(tr_full_in)
+        if tr_block:
+            out["topRight"] = tr_block
+
+        return out
+
+    def _normalize_code_hint(raw: str) -> str | None:
+        s = (raw or "").strip()
+        return normalize_map_code(s, require_digit=False) if s else None
+
+    def _normalize_time_hint(raw: float | None) -> float | None:
+        try:
+            if raw and float(raw) > 0:
+                return validate_time_seconds(round(float(raw), 2))
+        except Exception:
+            return None
+        return None
 
     # Normalize name hints (keep order, drop empties, de-dup)
     names_clean: list[str] = []
@@ -3429,6 +3481,17 @@ def run_ocr_pipeline(
     # Apply code hint preference (compare OCR vs provided)
     map_code_final = prefer_provided_code(map_code, code)
 
+    code_hint_norm = _normalize_code_hint(code)
+    code_source = None
+    code_verified_by = None
+    if map_code_final:
+        if code_hint_norm and map_code_final == code_hint_norm:
+            code_source = "hint"
+            if map_code and code_similarity(code_hint_norm, map_code) >= HINT_MATCH_THRESHOLD:
+                code_verified_by = "topLeft"
+        else:
+            code_source = "topLeft"
+
     # -------------------------------------------------------------------------
     # FLOW A: name(s) provided -> Banner (strict) then TOP5 (strict)
     #   + If time hint is provided, time must match ABSOLUTELY (via time_similarity/HINT_TIME_ABS_TOL)
@@ -3438,15 +3501,7 @@ def run_ocr_pipeline(
         names_to_try = names_clean[:5]
 
         # Parse + validate provided time hint (if any)
-        time_hint_raw: float | None = None
-        time_hint_valid: float | None = None
-        try:
-            if time and float(time) > 0:
-                time_hint_raw = round(float(time), 2)
-                time_hint_valid = validate_time_seconds(time_hint_raw)
-        except Exception:
-            time_hint_raw = None
-            time_hint_valid = None
+        time_hint_valid = _normalize_time_hint(time)
 
         picked_name: str | None = None
         seconds: float | None = None
@@ -3460,14 +3515,15 @@ def run_ocr_pipeline(
         top5_text = ""
         tr_debug_full = ""
 
+        time_source = None
+        time_verified_by = None
+
         def _time_hint_matches(ocr_time: float | None) -> bool:
             """
             Return True if provided time hint matches the OCR time with strict ABS tolerance.
             """
-            if time_hint_raw is None:
-                return True  # no hint -> not a constraint
             if time_hint_valid is None:
-                return False  # hint provided but invalid under constraints -> cannot match
+                return True  # no hint -> not a constraint
             if ocr_time is None:
                 return False
             return time_similarity(ocr_time, time_hint_valid) >= HINT_MATCH_THRESHOLD
@@ -3487,8 +3543,13 @@ def run_ocr_pipeline(
                 # If a time hint is provided, it MUST match. Otherwise we keep searching other names.
                 if _time_hint_matches(banner_time_confirmed):
                     picked_name = name_hint
-                    # If time hint exists and matches, prefer the provided time for stability.
-                    seconds = time_hint_valid if time_hint_raw is not None else validate_time_seconds(banner_time_confirmed)
+                    if time_hint_valid is not None:
+                        seconds = time_hint_valid
+                        time_source = "hint"
+                        time_verified_by = "banner"
+                    else:
+                        seconds = validate_time_seconds(banner_time_confirmed)
+                        time_source = "banner"
                     break
                 # else: mismatch -> keep searching for another (name,time) pair
 
@@ -3504,43 +3565,51 @@ def run_ocr_pipeline(
 
                 if _time_hint_matches(top5_time_confirmed):
                     picked_name = name_hint
-                    seconds = time_hint_valid if time_hint_raw is not None else validate_time_seconds(top5_time_confirmed)
+                    if time_hint_valid is not None:
+                        seconds = time_hint_valid
+                        time_source = "hint"
+                        time_verified_by = "topRight.top5"
+                    else:
+                        seconds = validate_time_seconds(top5_time_confirmed)
+                        time_source = "topRight.top5"
                     break
 
         # If a time hint was provided but no (name,time) pair matched it:
         # - If we at least confirmed a name, return that name with time=None.
         # - Otherwise return (None, None).
-        if time_hint_raw is not None and seconds is None:
+        if time_hint_valid is not None and seconds is None:
             picked_name = first_confirmed_name
             seconds = None
+            time_source = "unconfirmed"
 
-        top_right_debug = ""
-        if OCR_DEBUG_TEXTS:
-            if tr_debug_full:
-                top_right_debug += f"FULL: {tr_debug_full} "
-            if top5_text:
-                top_right_debug += f"TOP5: {top5_text}"
-            top_right_debug = top_right_debug.strip()
-
-        texts = ExtractedTexts(
-            top_left=text_top_left_en,
-            top_left_white=text_top_left_white_en,
-            top_left_cyan=text_top_left_cyan_en,
-            banner=(text_banner if OCR_DEBUG_TEXTS else ""),
-            top_right=(top_right_debug if OCR_DEBUG_TEXTS else ""),
-            bottom_left="",  # BL is intentionally skipped in this flow
+        texts_payload = _build_texts_payload(
+            include_bottom_left=False,
+            banner_text=text_banner,
+            top5_text_in=top5_text,
+            tr_full_in=(tr_debug_full if OCR_DEBUG_TEXTS else ""),
         )
+
+        sources: dict[str, object] = {
+            "name": "hint",
+            "code": code_source,
+            "time": time_source,
+        }
+        if code_verified_by:
+            sources["codeVerifiedBy"] = code_verified_by
+        if time_verified_by:
+            sources["timeVerifiedBy"] = time_verified_by
 
         elapsed = perf_counter() - t0
         logger.info(f"[ocr] names-flow t={elapsed:.2f}s fast={FAST_OCR}")
-        return ApiResponse(
-            extracted=ExtractedResult(
-                name=picked_name,
-                time=seconds,
-                code=map_code_final,
-                texts=texts,
-            )
-        )
+        return {
+            "extracted": {
+                "name": picked_name,
+                "time": seconds,
+                "code": map_code_final,
+                "sources": sources,
+                "texts": texts_payload,
+            }
+        }
 
     # -------------------------------------------------------------------------
     # FLOW B: normal flow (bottom-left name, then TL/top5/banner decision tree)
@@ -3562,36 +3631,54 @@ def run_ocr_pipeline(
 
     # ---- EARLY EXIT (fast path) ----
     if OCR_EARLY_EXIT and not ACCURATE_OCR and bl_name and map_code_final and top_left_time is not None:
-        seconds = pick_final_time(
+        seconds_ocr = pick_final_time(
             bl_name=bl_name,
             banner_name=None,
             banner_time=None,
             top5_time=None,
             top_left_time=top_left_time,
         )
-        seconds = prefer_provided_time(validate_time_seconds(seconds), time)
+        seconds_ocr = validate_time_seconds(seconds_ocr)
+        seconds = prefer_provided_time(seconds_ocr, time)
 
-        texts = ExtractedTexts(
-            top_left=text_top_left_en,
-            top_left_white=text_top_left_white_en,
-            top_left_cyan=text_top_left_cyan_en,
-            banner="",
-            top_right="",
-            bottom_left="",
+        time_source = "topLeft" if seconds_ocr is not None else None
+        time_hint_valid = _normalize_time_hint(time)
+        time_verified_by = None
+        if time_hint_valid is not None:
+            if seconds_ocr is None and OCR_TRUST_HINTS and seconds == time_hint_valid:
+                time_source = "hint"
+            elif seconds_ocr is not None and time_similarity(seconds_ocr, time_hint_valid) >= HINT_MATCH_THRESHOLD:
+                time_source = "hint"
+                time_verified_by = "topLeft"
+
+        texts_payload = _build_texts_payload(
+            include_bottom_left=True,
+            banner_text="",
+            top5_text_in="",
+            tr_full_in="",
         )
-        if OCR_DEBUG_TEXTS:
-            texts.bottom_left = join_lines(ocr_lines_cached(bottom_left, "en", cache))
+
+        sources: dict[str, object] = {
+            "name": "bottomLeft",
+            "code": code_source,
+            "time": time_source,
+        }
+        if code_verified_by:
+            sources["codeVerifiedBy"] = code_verified_by
+        if time_verified_by:
+            sources["timeVerifiedBy"] = time_verified_by
 
         elapsed = perf_counter() - t0
         logger.info(f"[ocr] fast-exit t={elapsed:.2f}s fast={FAST_OCR}")
-        return ApiResponse(
-            extracted=ExtractedResult(
-                name=bl_name,
-                time=seconds,
-                code=map_code_final,
-                texts=texts,
-            )
-        )
+        return {
+            "extracted": {
+                "name": bl_name,
+                "time": seconds,
+                "code": map_code_final,
+                "sources": sources,
+                "texts": texts_payload,
+            }
+        }
 
     # ---- TOP5 (only if time is missing or accurate mode) ----
     top5_text = ""
@@ -3604,33 +3691,54 @@ def run_ocr_pipeline(
         top5_time = extract_time_from_top5(top5_text, bl_name, min_similarity=0.78)
 
         if OCR_EARLY_EXIT and not ACCURATE_OCR and map_code_final and bl_name and top5_time is not None:
-            seconds = pick_final_time(
+            seconds_ocr = pick_final_time(
                 bl_name=bl_name,
                 banner_name=None,
                 banner_time=None,
                 top5_time=top5_time,
                 top_left_time=top_left_time,
             )
-            seconds = prefer_provided_time(validate_time_seconds(seconds), time)
+            seconds_ocr = validate_time_seconds(seconds_ocr)
+            seconds = prefer_provided_time(seconds_ocr, time)
 
-            texts = ExtractedTexts(
-                top_left=text_top_left_en,
-                top_left_white=text_top_left_white_en,
-                top_left_cyan=text_top_left_cyan_en,
-                banner="",
-                top_right=(f"TOP5: {top5_text}" if OCR_DEBUG_TEXTS and top5_text else ""),
-                bottom_left=(join_lines(ocr_lines_cached(bottom_left, "en", cache)) if OCR_DEBUG_TEXTS else ""),
+            time_source = "topRight.top5" if seconds_ocr is not None else None
+            time_hint_valid = _normalize_time_hint(time)
+            time_verified_by = None
+            if time_hint_valid is not None:
+                if seconds_ocr is None and OCR_TRUST_HINTS and seconds == time_hint_valid:
+                    time_source = "hint"
+                elif seconds_ocr is not None and time_similarity(seconds_ocr, time_hint_valid) >= HINT_MATCH_THRESHOLD:
+                    time_source = "hint"
+                    time_verified_by = "topRight.top5"
+
+            texts_payload = _build_texts_payload(
+                include_bottom_left=True,
+                banner_text="",
+                top5_text_in=top5_text,
+                tr_full_in=(tr_debug_full if OCR_DEBUG_TEXTS else ""),
             )
+
+            sources: dict[str, object] = {
+                "name": "bottomLeft",
+                "code": code_source,
+                "time": time_source,
+            }
+            if code_verified_by:
+                sources["codeVerifiedBy"] = code_verified_by
+            if time_verified_by:
+                sources["timeVerifiedBy"] = time_verified_by
+
             elapsed = perf_counter() - t0
             logger.info(f"[ocr] top5-exit t={elapsed:.2f}s fast={FAST_OCR}")
-            return ApiResponse(
-                extracted=ExtractedResult(
-                    name=bl_name,
-                    time=seconds,
-                    code=map_code_final,
-                    texts=texts,
-                )
-            )
+            return {
+                "extracted": {
+                    "name": bl_name,
+                    "time": seconds,
+                    "code": map_code_final,
+                    "sources": sources,
+                    "texts": texts_payload,
+                }
+            }
 
     # ---- BANNER (only if still missing time OR accurate mode) ----
     text_banner = ""
@@ -3669,42 +3777,66 @@ def run_ocr_pipeline(
             banner_time = extract_banner_time_seconds(text_banner)
 
     # ---- Final time decision tree ----
-    seconds = pick_final_time(
+    seconds_ocr = pick_final_time(
         bl_name=bl_name,
         banner_name=banner_name,
         banner_time=banner_time,
         top5_time=top5_time,
         top_left_time=top_left_time,
     )
-    seconds = prefer_provided_time(validate_time_seconds(seconds), time)
+    seconds_ocr = validate_time_seconds(seconds_ocr)
+    seconds = prefer_provided_time(seconds_ocr, time)
 
-    top_right_debug = ""
-    if OCR_DEBUG_TEXTS:
-        if tr_debug_full:
-            top_right_debug += f"FULL: {tr_debug_full} "
-        if top5_text:
-            top_right_debug += f"TOP5: {top5_text}"
-        top_right_debug = top_right_debug.strip()
+    time_source = None
+    if seconds_ocr is not None:
+        bt = validate_time_seconds(banner_time)
+        t5 = validate_time_seconds(top5_time)
+        tl = validate_time_seconds(top_left_time)
 
-    texts = ExtractedTexts(
-        top_left=text_top_left_en,
-        top_left_white=text_top_left_white_en,
-        top_left_cyan=text_top_left_cyan_en,
-        banner=text_banner,
-        top_right=top_right_debug,
-        bottom_left=(join_lines(ocr_lines_cached(bottom_left, "en", cache)) if OCR_DEBUG_TEXTS else ""),
+        if bl_name and banner_name and names_match(bl_name, banner_name) and bt is not None and seconds_ocr == bt:
+            time_source = "banner"
+        elif t5 is not None and seconds_ocr == t5:
+            time_source = "topRight.top5"
+        elif tl is not None and seconds_ocr == tl:
+            time_source = "topLeft"
+
+    time_hint_valid = _normalize_time_hint(time)
+    time_verified_by = None
+    if time_hint_valid is not None:
+        if seconds_ocr is None and OCR_TRUST_HINTS and seconds == time_hint_valid:
+            time_source = "hint"
+        elif seconds_ocr is not None and time_similarity(seconds_ocr, time_hint_valid) >= HINT_MATCH_THRESHOLD:
+            time_verified_by = time_source
+            time_source = "hint"
+
+    texts_payload = _build_texts_payload(
+        include_bottom_left=True,
+        banner_text=text_banner,
+        top5_text_in=top5_text,
+        tr_full_in=(tr_debug_full if OCR_DEBUG_TEXTS else ""),
     )
+
+    sources: dict[str, object] = {
+        "name": "bottomLeft" if bl_name else None,
+        "code": code_source,
+        "time": time_source,
+    }
+    if code_verified_by:
+        sources["codeVerifiedBy"] = code_verified_by
+    if time_verified_by:
+        sources["timeVerifiedBy"] = time_verified_by
 
     elapsed = perf_counter() - t0
     logger.info(f"[ocr] done t={elapsed:.2f}s fast={FAST_OCR}")
-    return ApiResponse(
-        extracted=ExtractedResult(
-            name=bl_name,
-            time=seconds,
-            code=map_code_final,
-            texts=texts,
-        )
-    )
+    return {
+        "extracted": {
+            "name": bl_name,
+            "time": seconds,
+            "code": map_code_final,
+            "sources": sources,
+            "texts": texts_payload,
+        }
+    }
 
 
 # =============================================================================
@@ -3931,7 +4063,7 @@ def ping() -> dict:
 
 
 @app.post("/extract", response_model=ApiResponse)
-async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiResponse:
+async def extract_ocr_data(payload: ImageURLPayload, request: Request):
     """
     Main API endpoint: fetch an image by URL and run OCR extraction.
 
@@ -3984,7 +4116,7 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
         raise HTTPException(status_code=500, detail=f"unexpected error: {e}")
 
     try:
-        return await _enqueue_ocr(
+        res = await _enqueue_ocr(
             request.app,
             img,
             image_url,
@@ -3992,6 +4124,9 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request) -> ApiRes
             time=payload.time,
             names=payload.names,
         )
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(content=res)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="ocr timeout (queue + run)")
 
