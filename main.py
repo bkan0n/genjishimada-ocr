@@ -3290,18 +3290,20 @@ def prefer_provided_code(extracted_code: str | None, provided_code: str | None) 
     If provided_code matches extracted_code at >= 90%, return provided_code.
     Otherwise return extracted_code (or provided_code only if OCR_TRUST_HINTS fallback is enabled).
     """
-    provided = normalize_map_code((provided_code or "").strip(), require_digit=False) if (provided_code or "").strip() else None
-    if not provided:
+    provided_raw = (provided_code or "").strip()
+    if not provided_raw:
+        # No hint provided -> normal behavior
         return extracted_code
 
+    provided = normalize_map_code(provided_raw, require_digit=False)
+    if not provided:
+        return None
+
+    # Require OCR extraction + strong match
     if extracted_code and code_similarity(provided, extracted_code) >= HINT_MATCH_THRESHOLD:
         return provided
 
-    # Optional fallback if OCR couldn't extract.
-    if OCR_TRUST_HINTS and not extracted_code:
-        return provided
-
-    return extracted_code
+    return None
 
 
 def prefer_provided_time(extracted_time: float | None, provided_time: float | None) -> float | None:
@@ -3484,12 +3486,19 @@ def run_ocr_pipeline(
     code_hint_norm = _normalize_code_hint(code)
     code_source = None
     code_verified_by = None
-    if map_code_final:
-        if code_hint_norm and map_code_final == code_hint_norm:
+
+    if (code_hint_norm or "").strip():
+        # Hint was provided: we only return code if it matched OCR
+        if map_code_final is not None:
             code_source = "hint"
-            if map_code and code_similarity(code_hint_norm, map_code) >= HINT_MATCH_THRESHOLD:
-                code_verified_by = "topLeft"
+            code_verified_by = "topLeft"
         else:
+            # hint present but not confirmed by OCR
+            # (either OCR couldn't extract, or mismatch)
+            code_source = "hintMismatch" if map_code is not None else "hintUnconfirmed"
+    else:
+        # No hint provided: normal OCR behavior
+        if map_code_final:
             code_source = "topLeft"
 
     # -------------------------------------------------------------------------
