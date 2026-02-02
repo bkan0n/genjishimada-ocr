@@ -242,7 +242,7 @@ class ApiResponse(CamelModel):
 # =============================================================================
 ROI_TOPLEFT = [0.010, 0.020, 0.360, 0.300]
 ROI_TOPLEFT_WIDE = [0.005, 0.010, 0.420, 0.340]
-ROI_BANNER_TIGHT = [0.240, 0.168, 0.760, 0.380]
+ROI_BANNER_TIGHT = [0.155, 0.168, 0.842, 0.498]
 ROI_TOPRIGHT = [0.821, 0.077, 0.985, 0.565]
 ROI_BOTTOMLEFT = [0.050, 0.825, 0.330, 0.990]
 
@@ -2494,13 +2494,18 @@ def extract_banner_time_seconds(text: str) -> float | None:
         .replace("5EC", "SEC")
         .replace("SE€", "SEC")
         .replace("SEL", "SEC")
+        .replace("SEG", "SEC")
     )
     text = re.sub(RE_SPACES, " ", text).strip()
+    # Normalize common noisy numeric forms
+    text = re.sub(r"(\d{1,5})\s*[,\s]\s*(\d{1,2})", r"\1.\2", text)
 
     time_idx = text.find("TIME")
     if time_idx != -1:
         window = text[time_idx : time_idx + 90]
+        window = window.replace("O", "0")  # O -> 0 for misread numbers
         window = re.sub(r"([0-9OQDBZGISL]{1,5})\s+([0-9OQDBZGISL]{1}\.\d{2})", r"\1\2", window)
+        window = re.sub(r"(\d{1,5})\s*[,\s]\s*(\d{1,2})", r"\1.\2", window)
         m = re.search(RE_PARSE_BANNER_TIME_SEARCH_WITH_SEC, window)
         if m:
             v = parse_loose_numeric_token(m.group(1))
@@ -2544,6 +2549,9 @@ def extract_time_from_top_left(text_top_left: str, text_top_left_white: str) -> 
       - Then falls back to collecting all numeric candidates and returning the maximum.
     """
     src = f"{text_top_left_white or ''} {text_top_left or ''}".upper()
+    # Normalize common noisy numeric
+    src = re.sub(RE_SPACES, " ", src).strip()
+    src = re.sub(r"(\d{1,5})\s*[,\s]\s*(\d{1,2})", r"\1.\2", src)
     m = re.search(RE_PARSE_TIME_AGAIN, src)
     if m:
         try:
