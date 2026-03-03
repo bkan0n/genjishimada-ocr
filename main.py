@@ -243,7 +243,7 @@ class ApiResponse(CamelModel):
 ROI_TOPLEFT = [0.010, 0.020, 0.360, 0.300]
 ROI_TOPLEFT_WIDE = [0.005, 0.010, 0.420, 0.340]
 ROI_BANNER_TIGHT = [0.155, 0.168, 0.842, 0.498]
-ROI_TOPRIGHT = [0.821, 0.077, 0.985, 0.565]
+ROI_TOPRIGHT = [0.821, 0.077, 0.985, 0.722]
 ROI_BOTTOMLEFT = [0.050, 0.825, 0.330, 0.990]
 
 # TOP5 strip inside ROI_TOPRIGHT (to avoid "HOLD ... LEADERBOARD" junk)
@@ -2849,16 +2849,61 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
 
     entries: list[tuple[int, str, float]] = []
 
+    def _append_ascii_entry(pos: int, raw_name: str, t: float) -> None:
+        """
+        Internal helper: normalize/validate an ASCII name candidate before adding it.
+        """
+        nm = _strip_rank_prefix_ascii(raw_name)
+        if not nm or nm in _GENERIC_ASCII:
+            return
+        if not any(ch.isalpha() for ch in nm):
+            return
+        if not re.fullmatch(RE_ASCII_NAME_MATCH, nm):
+            return
+        entries.append((pos, nm, t))
+
     # ASCII entries
     for m in re.finditer(RE_TOP5_TIME_FOR_NAME_ASCII, block_upper):
-        nm = (m.group(1) or "").upper()
-        nm = _strip_rank_prefix_ascii(nm)
-        if not nm or nm in _GENERIC_ASCII:
-            continue
         t = _to_float(m.group(2))
         if t is None:
             continue
-        entries.append((m.start(), nm, t))
+        _append_ascii_entry(m.start(), (m.group(1) or "").upper(), t)
+
+    # Fallback for split ASCII names around time tokens, e.g. "BRAT1 SHKA7 833.79 SEC".
+    # We build short joined tails from the text right before each time and let
+    # similarity scoring decide the best candidate.
+    re_time_any = re.compile(r"(?<![0-9.,])(\d{1,5}[.,]\d{2})\s*(?:SEC|ì´ˆ)?", re.IGNORECASE)
+    re_ascii_chunk = re.compile(r"[A-Z0-9_]{2,24}")
+    noise_tokens = _GENERIC_ASCII | {
+        "TOP5",
+        "CTRL",
+        "CONTROL",
+        "PERSON",
+        "CLASS",
+        "SERVER",
+        "CAMERA",
+        "PLAYTEST",
+        "QUICK",
+        "RESET",
+        "SPECTATE",
+        "HCTRLE",
+        "TRLE",
+    }
+    for mt in re.finditer(re_time_any, block_upper):
+        t = _to_float(mt.group(1))
+        if t is None:
+            continue
+        before = block_upper[max(0, mt.start() - 52) : mt.start()]
+        chunks = [tok for tok in re.findall(re_ascii_chunk, before) if any(ch.isalpha() for ch in tok)]
+        if not chunks:
+            continue
+        filtered = [tok for tok in chunks if tok not in noise_tokens]
+        if not filtered:
+            continue
+        tail = filtered[-3:]
+        for n in range(1, len(tail) + 1):
+            joined = "".join(tail[-n:])
+            _append_ascii_entry(mt.start(), joined, t)
 
     # CJK entries
     for m in re.finditer(RE_TOP5_TIME_FOR_NAME_CJK, block_raw):
