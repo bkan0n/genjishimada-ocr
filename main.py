@@ -3204,7 +3204,16 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
         colon_candidates[cand] = colon_candidates.get(cand, 0) + 1
 
     if colon_candidates:
-        best, _ = max(colon_candidates.items(), key=lambda kv: kv[1])
+        best, _ = max(
+            colon_candidates.items(),
+            key=lambda kv: (
+                kv[1],
+                int(any(ch.isalpha() for ch in kv[0]) and any(ch.isdigit() for ch in kv[0])),
+                int(any(ch.isdigit() for ch in kv[0])),
+                sum(ch.isdigit() for ch in kv[0]),
+                len(kv[0]),
+            ),
+        )
         return best
 
     scores_all: dict[str, float] = defaultdict(float)
@@ -3478,20 +3487,35 @@ def run_ocr_pipeline(
     tl_lines.extend(ocr_lines_cached(top_left_wide, "en", cache))
     text_top_left_en = join_lines(tl_lines)
 
+    code_hint_norm = _normalize_code_hint(code)
+
     # Quick code attempt WITHOUT masks (cheap).
     map_code = extract_code(text_top_left_en, "", "")
-    if map_code is None:
-        # Only do masks if needed for code
+    need_mask_pass = map_code is None
+    if (not need_mask_pass) and code_hint_norm:
+        # If a hint is present but the quick pass disagrees, run masked OCR before
+        # deciding this is a mismatch.
+        need_mask_pass = code_similarity(code_hint_norm, map_code) < HINT_MATCH_THRESHOLD
+
+    if need_mask_pass:
+        # Only do masks if needed for code refinement
         tl_white_mask = mask_white_regions(top_left_wide)
         tl_cyan_mask = mask_cyan_regions(top_left_wide)
         text_top_left_white_en = join_lines(ocr_lines_cached(tl_white_mask, "en", cache)) if tl_white_mask is not None else ""
         text_top_left_cyan_en = join_lines(ocr_lines_cached(tl_cyan_mask, "en", cache)) if tl_cyan_mask is not None else ""
-        map_code = extract_code(text_top_left_en, text_top_left_white_en, text_top_left_cyan_en)
+        refined_map_code = extract_code(text_top_left_en, text_top_left_white_en, text_top_left_cyan_en)
+        if refined_map_code:
+            if map_code is None:
+                map_code = refined_map_code
+            elif code_hint_norm:
+                if code_similarity(code_hint_norm, refined_map_code) >= code_similarity(code_hint_norm, map_code):
+                    map_code = refined_map_code
+            elif any(ch.isdigit() for ch in refined_map_code) and not any(ch.isdigit() for ch in map_code):
+                map_code = refined_map_code
 
     # Apply code hint preference (compare OCR vs provided)
     map_code_final = prefer_provided_code(map_code, code)
 
-    code_hint_norm = _normalize_code_hint(code)
     code_source = None
     code_verified_by = None
 
