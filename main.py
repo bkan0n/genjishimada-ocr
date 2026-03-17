@@ -242,8 +242,8 @@ class ApiResponse(CamelModel):
 # =============================================================================
 ROI_TOPLEFT = [0.010, 0.020, 0.360, 0.300]
 ROI_TOPLEFT_WIDE = [0.005, 0.010, 0.420, 0.340]
-ROI_BANNER_TIGHT = [0.155, 0.168, 0.842, 0.498]
-ROI_TOPRIGHT = [0.821, 0.077, 0.985, 0.722]
+ROI_BANNER_TIGHT = [0.240, 0.083, 0.760, 0.557]
+ROI_TOPRIGHT = [0.821, 0.077, 0.985, 0.664]
 ROI_BOTTOMLEFT = [0.050, 0.825, 0.330, 0.990]
 
 # TOP5 strip inside ROI_TOPRIGHT (to avoid "HOLD ... LEADERBOARD" junk)
@@ -900,6 +900,41 @@ def upscale(image_bgr: np.ndarray, scale: float) -> np.ndarray:
       - Uses INTER_CUBIC for smoother edges.
     """
     return cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+
+def build_map_code_variants(roi_bgr: np.ndarray) -> list[np.ndarray]:
+    """
+    Build focused OCR variants for top-left code extraction.
+
+    Purpose:
+      - Recover short map codes that get degraded inside the full top-left HUD block.
+      - Emphasize thin trailing characters via stronger white-mask and threshold variants.
+    """
+    if roi_bgr is None or roi_bgr.size == 0:
+        return []
+
+    variants: list[np.ndarray] = []
+    base = roi_bgr
+    variants.append(base)
+
+    h, w = base.shape[:2]
+    scale = 3.6 if min(h, w) < 120 else 3.0
+    up = unsharp(upscale(base, scale), amount=1.9, sigma=0.9)
+    variants.append(up)
+
+    white = mask_white_regions(base)
+    variants.append(white)
+
+    white_up = cv2.resize(white, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+    white_up = cv2.dilate(white_up, _KERNEL_3, iterations=1)
+    variants.append(white_up)
+
+    gray = enhance_contrast_grayscale(base)
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
+    variants.append(thr)
+    variants.append(255 - thr)
+
+    return variants
 
 
 def build_cjk_variants(roi_bgr: np.ndarray) -> list[np.ndarray]:
@@ -1879,7 +1914,15 @@ def _normalize_code_for_compare(code: str) -> str:
     s = s.upper()
     s = re.sub(r"[^A-Z0-9]", "", s)
     # Common OCR confusions (safe for codes)
-    s = s.replace("O", "0").replace("I", "1").replace("L", "1").replace("S", "5").replace("B", "8").replace("Z", "2")
+    s = (
+        s.replace("O", "0")
+        .replace("Q", "0")
+        .replace("I", "1")
+        .replace("L", "1")
+        .replace("S", "5")
+        .replace("B", "8")
+        .replace("Z", "2")
+    )
     return s
 
 
@@ -1938,6 +1981,27 @@ def time_similarity(extracted: float | None, hinted: float | None) -> float:
 
     diff = abs(a - b)
     return 1.0 if diff <= HINT_TIME_ABS_TOL else 0.0
+
+
+def is_likely_leading_digit_truncation(shorter: float | None, fuller: float | None) -> bool:
+    """
+    Detect when OCR likely dropped one leading digit from a time value.
+
+    Purpose:
+      - Keep the rule narrow so it only fires on strong suffix evidence.
+    """
+    if shorter is None or fuller is None:
+        return False
+    try:
+        s = int(round(float(shorter) * 100))
+        f = int(round(float(fuller) * 100))
+    except Exception:
+        return False
+    if f <= s:
+        return False
+    ss = str(s)
+    fs = str(f)
+    return len(fs) == len(ss) + 1 and fs.endswith(ss)
 
 
 # =============================================================================
@@ -2714,6 +2778,12 @@ def extract_confirmed_time_from_banner(
             if t is not None:
                 return t, text, nm
 
+        # Some maps render a leaderboard list inside the banner ROI rather than a
+        # "MISSION COMPLETE" sentence. Reuse the leaderboard parser on banner text.
+        t_list = validate_time_seconds(extract_time_from_top5(text, name_hint, min_similarity=HINT_MATCH_THRESHOLD))
+        if t_list is not None:
+            return t_list, text, name_hint
+
     return None, last_text, last_name
 
 
@@ -2831,23 +2901,32 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
         Returns:
           - float value if parseable, else None.
         """
-        try:
-            return float((s or "").replace(",", "."))
-        except Exception:
-            return None
+        return parse_loose_numeric_token(remove_all_whitespace(s or ""))
+
+    def _normalize_top5_time_layout(text: str) -> str:
+        text = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", r"\1\2", text)
+        return re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", text)
 
     # Normalize and isolate TOP5 block
     upper_full = (top5_text or "").upper()
     m_top5 = RE_TOP5_SECTION.search(upper_full)
     block_upper = upper_full[m_top5.start() :] if m_top5 else upper_full
-    block_upper = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", block_upper)
+    block_upper = _normalize_top5_time_layout(block_upper)
 
     block_raw = top5_text
     m2 = RE_TOP5_SECTION.search(block_raw)
     block_raw = block_raw[m2.start() :] if m2 else block_raw
-    block_raw = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", block_raw)
+    block_raw = _normalize_top5_time_layout(block_raw)
 
     entries: list[tuple[int, str, float]] = []
+    re_top5_time_for_name_ascii = re.compile(
+        r"\b([A-Z][A-Z0-9_]{2,24})\b(?:\s*[-:|]\s*|\s+)((?:\d{1,2}\s+)?\d{1,5}[.,]\d{2})\s*(?:SEC|ì´ˆ)?",
+        re.IGNORECASE,
+    )
+    re_top5_time_for_name_cjk = re.compile(
+        rf"([{_CJK_ALL}]{{2,40}})(?:\s*[-:|]\s*|\s+)((?:\d{{1,2}}\s+)?\d{{1,5}}[.,]\d{{2}})\s*(?:SEC|ì´ˆ)?",
+        re.IGNORECASE,
+    )
 
     def _append_ascii_entry(pos: int, raw_name: str, t: float) -> None:
         """
@@ -2863,7 +2942,7 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
         entries.append((pos, nm, t))
 
     # ASCII entries
-    for m in re.finditer(RE_TOP5_TIME_FOR_NAME_ASCII, block_upper):
+    for m in re.finditer(re_top5_time_for_name_ascii, block_upper):
         t = _to_float(m.group(2))
         if t is None:
             continue
@@ -2873,6 +2952,7 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
     # We build short joined tails from the text right before each time and let
     # similarity scoring decide the best candidate.
     re_time_any = re.compile(r"(?<![0-9.,])(\d{1,5}[.,]\d{2})\s*(?:SEC|ì´ˆ)?", re.IGNORECASE)
+    re_time_any = re.compile(r"(?<![0-9.,])((?:\d{1,2}\s+)?\d{1,5}[.,]\d{2})\s*(?:SEC|ÃƒÂ¬Ã‚Â´Ã‹â€ |Ã¬Â´Ë†)?", re.IGNORECASE)
     re_ascii_chunk = re.compile(r"[A-Z0-9_]{2,24}")
     noise_tokens = _GENERIC_ASCII | {
         "TOP5",
@@ -2906,7 +2986,7 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
             _append_ascii_entry(mt.start(), joined, t)
 
     # CJK entries
-    for m in re.finditer(RE_TOP5_TIME_FOR_NAME_CJK, block_raw):
+    for m in re.finditer(re_top5_time_for_name_cjk, block_raw):
         nm = _cjk_best_substring(m.group(1) or "")
         if not nm or count_cjk(nm) < 2:
             continue
@@ -3229,28 +3309,30 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
       - Uses `normalize_map_code()` for validation.
     """
     """Extract the map code using heuristic passes."""
-    all_text = " ".join([top_left_text or "", top_left_white_text or "", top_left_cyan_text or ""]).upper()
-    normalized = re.sub(RE_MAP_CODE_NORMALIZATION, "MAP CODE", all_text)
-
-    m_keyword = re.search(RE_CODE_KEYWORD_EXTRACT, normalized)
-    if m_keyword:
-        cand = normalize_map_code(m_keyword.group(1) or "", require_digit=False)
-        if cand:
-            return cand
-
-    colon_candidates: dict[str, int] = {}
-    for m in re.finditer(RE_CODE_AFTER_COLON, normalized):
-        token = m.group(1) or ""
-        cand = normalize_map_code(token, require_digit=False)
-        if not cand:
+    source_texts: list[tuple[str, float]] = [
+        ((top_left_text or "").upper(), 1.0),
+        ((top_left_white_text or "").upper(), 1.1),
+        ((top_left_cyan_text or "").upper(), 1.5),
+    ]
+    normalized_sources: list[tuple[str, float]] = []
+    for source_text, weight in source_texts:
+        if not source_text.strip():
             continue
-        if not any(ch.isalpha() for ch in cand):
-            continue
-        colon_candidates[cand] = colon_candidates.get(cand, 0) + 1
+        normalized_sources.append((re.sub(RE_MAP_CODE_NORMALIZATION, "MAP CODE", source_text), weight))
 
-    if colon_candidates:
+    normalized = " ".join(text for text, _ in normalized_sources)
+
+    keyword_candidates: dict[str, float] = defaultdict(float)
+    for source_text, weight in normalized_sources:
+        for m_keyword in re.finditer(RE_CODE_KEYWORD_EXTRACT, source_text):
+            cand = normalize_map_code(m_keyword.group(1) or "", require_digit=False)
+            if not cand:
+                continue
+            keyword_candidates[cand] += weight
+
+    if keyword_candidates:
         best, _ = max(
-            colon_candidates.items(),
+            keyword_candidates.items(),
             key=lambda kv: (
                 kv[1],
                 int(any(ch.isalpha() for ch in kv[0]) and any(ch.isdigit() for ch in kv[0])),
@@ -3261,8 +3343,54 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
         )
         return best
 
+    colon_candidates: dict[str, float] = defaultdict(float)
+    for source_text, weight in normalized_sources:
+        for m in re.finditer(RE_CODE_AFTER_COLON, source_text):
+            token = m.group(1) or ""
+            cand = normalize_map_code(token, require_digit=False)
+            if not cand:
+                continue
+
+            letters = sum(ch.isalpha() for ch in cand)
+            digits = sum(ch.isdigit() for ch in cand)
+            if letters == 0:
+                continue
+
+            score = float(weight)
+            if 5 <= len(cand) <= 6:
+                score += 0.30
+            if letters >= digits:
+                score += 0.30
+            if digits == 0:
+                score += 0.15
+            if digits >= 3:
+                score -= 0.20
+
+            before = source_text[max(0, m.start() - 20) : m.start()]
+            after = source_text[m.end() : m.end() + 20]
+            if "MAP" in before[-15:] or "MAP" in after[:15]:
+                score += 1.00
+            if "CODE" in before[-15:] or "CODE" in after[:15]:
+                score += 1.00
+            if "TIME" in before[-15:] or "SEC" in after[:10]:
+                score -= 1.00
+
+            colon_candidates[cand] += score
+
+    if colon_candidates:
+        best, _ = max(
+            colon_candidates.items(),
+            key=lambda kv: (
+                kv[1],
+                len(kv[0]),
+                sum(ch.isalpha() for ch in kv[0]),
+                int(any(ch.isdigit() for ch in kv[0])),
+                -sum(ch.isdigit() for ch in kv[0]),
+            ),
+        )
+        return best
+
     scores_all: dict[str, float] = defaultdict(float)
-    scores_with_letter: dict[str, float] = defaultdict(float)
 
     for m in re.finditer(RE_MAP_CODE_FIND, normalized):
         token = m.group(0)
@@ -3310,15 +3438,54 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
             score -= 1.0
 
         scores_all[cand] += score
-        if has_letter:
-            scores_with_letter[cand] += score
 
     if not scores_all:
         return None
 
-    pool = scores_with_letter if scores_with_letter else scores_all
-    best_code, _ = max(pool.items(), key=lambda kv: (kv[1], sum(c.isdigit() for c in kv[0])))
+    best_code, _ = max(
+        scores_all.items(),
+        key=lambda kv: (
+            kv[1],
+            int(any(c.isalpha() for c in kv[0]) and any(c.isdigit() for c in kv[0])),
+            int(any(c.isalpha() for c in kv[0])),
+            -sum(c.isdigit() for c in kv[0]),
+            len(kv[0]),
+        ),
+    )
     return best_code
+
+
+def extract_code_from_code_variants(
+    top_left_bgr: np.ndarray,
+    cache: dict[tuple[str, int, tuple[int, ...]], list[tuple[str, float]]],
+) -> str | None:
+    """
+    OCR the top-left HUD with extra preprocessing variants and extract the code.
+
+    Purpose:
+      - Add stronger preprocessing when the standard raw/white/cyan passes disagree.
+      - Recover final characters that disappear in the initial OCR blob.
+    """
+    variants = build_map_code_variants(top_left_bgr)
+    if not variants:
+        return None
+
+    primary_texts: list[str] = []
+    white_texts: list[str] = []
+    aux_texts: list[str] = []
+
+    for idx, variant in enumerate(variants):
+        text = join_lines(ocr_lines_cached(variant, "en", cache))
+        if not text:
+            continue
+        if idx < 2:
+            primary_texts.append(text)
+        elif idx < 4:
+            white_texts.append(text)
+        else:
+            aux_texts.append(text)
+
+    return extract_code(" ".join(primary_texts), " ".join(white_texts), " ".join(aux_texts))
 
 
 # =============================================================================
@@ -3361,9 +3528,10 @@ def prefer_provided_code(extracted_code: str | None, provided_code: str | None) 
     if not provided:
         return None
 
-    # Require OCR extraction + strong match
-    if extracted_code and code_similarity(provided, extracted_code) >= HINT_MATCH_THRESHOLD:
-        return provided
+    # Require OCR extraction + strong match.
+    if extracted_code:
+        if code_similarity(provided, extracted_code) >= HINT_MATCH_THRESHOLD:
+            return provided
 
     return None
 
@@ -3527,6 +3695,7 @@ def run_ocr_pipeline(
     text_top_left_en = ""
     text_top_left_white_en = ""
     text_top_left_cyan_en = ""
+    top_left_time: float | None = None
 
     tl_lines: list[tuple[str, float]] = []
     tl_lines.extend(ocr_lines_cached(top_left_wide, "en", cache))
@@ -3549,6 +3718,15 @@ def run_ocr_pipeline(
         text_top_left_white_en = join_lines(ocr_lines_cached(tl_white_mask, "en", cache)) if tl_white_mask is not None else ""
         text_top_left_cyan_en = join_lines(ocr_lines_cached(tl_cyan_mask, "en", cache)) if tl_cyan_mask is not None else ""
         refined_map_code = extract_code(text_top_left_en, text_top_left_white_en, text_top_left_cyan_en)
+        variant_map_code = extract_code_from_code_variants(top_left_wide, cache)
+        if variant_map_code:
+            if refined_map_code is None:
+                refined_map_code = variant_map_code
+            elif code_hint_norm:
+                if code_similarity(code_hint_norm, variant_map_code) >= code_similarity(code_hint_norm, refined_map_code):
+                    refined_map_code = variant_map_code
+            elif len(variant_map_code) > len(refined_map_code):
+                refined_map_code = variant_map_code
         if refined_map_code:
             if map_code is None:
                 map_code = refined_map_code
@@ -3614,6 +3792,18 @@ def run_ocr_pipeline(
                 return False
             return time_similarity(ocr_time, time_hint_valid) >= HINT_MATCH_THRESHOLD
 
+        def _get_top_left_time_for_validation() -> float | None:
+            nonlocal top_left_time, text_top_left_white_en
+            if top_left_time is not None:
+                return top_left_time
+            if not text_top_left_white_en:
+                tl_white_mask = mask_white_regions(top_left_wide)
+                text_top_left_white_en = (
+                    join_lines(ocr_lines_cached(tl_white_mask, "en", cache)) if tl_white_mask is not None else ""
+                )
+            top_left_time = extract_time_from_top_left(text_top_left_en, text_top_left_white_en)
+            return top_left_time
+
         for name_hint in names_to_try:
             # 1) Banner-confirmed time first (name is STRICTLY confirmed inside)
             banner_time_confirmed, text_banner, banner_name = extract_confirmed_time_from_banner(
@@ -3649,6 +3839,14 @@ def run_ocr_pipeline(
                 if first_confirmed_name is None:
                     first_confirmed_name = name_hint
 
+                # TOP5 is prone to dropping the leading thousands digit; if the
+                # top-left HUD shows the same suffix with one extra leading digit,
+                # don't let TOP5 validate the provided hint.
+                if time_hint_valid is not None:
+                    tl_for_validation = _get_top_left_time_for_validation()
+                    if is_likely_leading_digit_truncation(top5_time_confirmed, tl_for_validation):
+                        continue
+
                 if _time_hint_matches(top5_time_confirmed):
                     picked_name = name_hint
                     if time_hint_valid is not None:
@@ -3660,13 +3858,25 @@ def run_ocr_pipeline(
                         time_source = "topRight.top5"
                     break
 
-        # If a time hint was provided but no (name,time) pair matched it:
-        # - If we at least confirmed a name, return that name with time=None.
-        # - Otherwise return (None, None).
+        # If banner/top5 confirmed the name but not the hinted time, allow the
+        # top-left timer to corroborate the same hint before returning unconfirmed.
         if time_hint_valid is not None and seconds is None:
-            picked_name = first_confirmed_name
-            seconds = None
-            time_source = "unconfirmed"
+            if not text_top_left_white_en:
+                tl_white_mask = mask_white_regions(top_left_wide)
+                text_top_left_white_en = (
+                    join_lines(ocr_lines_cached(tl_white_mask, "en", cache)) if tl_white_mask is not None else ""
+                )
+            top_left_time = extract_time_from_top_left(text_top_left_en, text_top_left_white_en)
+
+            if first_confirmed_name and _time_hint_matches(top_left_time):
+                picked_name = first_confirmed_name
+                seconds = time_hint_valid
+                time_source = "hint"
+                time_verified_by = "topLeft"
+            else:
+                picked_name = first_confirmed_name
+                seconds = None
+                time_source = "unconfirmed"
 
         texts_payload = _build_texts_payload(
             include_bottom_left=False,
@@ -3841,6 +4051,11 @@ def run_ocr_pipeline(
         text_banner = normalize_banner_fragment(join_lines(banner_lines))
         banner_name = extract_name_from_banner(text_banner)
         banner_time = extract_banner_time_seconds(text_banner)
+        if bl_name and (banner_name is None or banner_time is None):
+            banner_time_list = validate_time_seconds(extract_time_from_top5(text_banner, bl_name, min_similarity=0.78))
+            if banner_time_list is not None:
+                banner_name = bl_name
+                banner_time = banner_time_list
 
         if (banner_time is None or (bl_name and banner_name and not names_match(bl_name, banner_name))) and not FAST_OCR:
             banner_gray = enhance_contrast_grayscale(banner)
@@ -3861,6 +4076,11 @@ def run_ocr_pipeline(
             text_banner = normalize_banner_fragment(join_lines(banner_lines + extra))
             banner_name = extract_name_from_banner(text_banner)
             banner_time = extract_banner_time_seconds(text_banner)
+            if bl_name and (banner_name is None or banner_time is None):
+                banner_time_list = validate_time_seconds(extract_time_from_top5(text_banner, bl_name, min_similarity=0.78))
+                if banner_time_list is not None:
+                    banner_name = bl_name
+                    banner_time = banner_time_list
 
     # ---- Final time decision tree ----
     seconds_ocr = pick_final_time(
