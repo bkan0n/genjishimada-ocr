@@ -2901,10 +2901,42 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
         Returns:
           - float value if parseable, else None.
         """
-        return parse_loose_numeric_token(remove_all_whitespace(s or ""))
+        token = re.sub(RE_SPACES, " ", (s or "")).strip()
+        if not token:
+            return None
+
+        joined = validate_time_seconds(parse_loose_numeric_token(remove_all_whitespace(token)))
+
+        m_split = re.fullmatch(r"(\d{1,2})\s+(\d{1,5}[.,]\d{2})", token)
+        if not m_split:
+            return joined
+
+        suffix = validate_time_seconds(parse_loose_numeric_token(m_split.group(2)))
+        if joined is None:
+            return suffix
+        if suffix is None:
+            return joined
+
+        int_part = re.split(r"[.,]", m_split.group(2), maxsplit=1)[0]
+        int_digits = len(re.sub(r"\D", "", int_part))
+
+        # If the suffix already carries four digits before the decimal separator,
+        # the isolated leading digit(s) are often a leaked leaderboard rank rather
+        # than part of the time
+        if int_digits >= 4:
+            return suffix
+        return joined
 
     def _normalize_top5_time_layout(text: str) -> str:
-        text = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", r"\1\2", text)
+        def _merge_split_time(m) -> str:
+            tail = m.group(2) or ""
+            int_part = re.split(r"[.,]", tail, maxsplit=1)[0]
+            int_digits = len(re.sub(r"\D", "", int_part))
+            if int_digits >= 4:
+                return m.group(0)
+            return f"{m.group(1)}{tail}"
+
+        text = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", _merge_split_time, text)
         return re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", text)
 
     # Normalize and isolate TOP5 block
@@ -2932,6 +2964,9 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
         """
         Internal helper: normalize/validate an ASCII name candidate before adding it.
         """
+        t = validate_time_seconds(t)
+        if t is None:
+            return
         nm = _strip_rank_prefix_ascii(raw_name)
         if not nm or nm in _GENERIC_ASCII:
             return
@@ -2990,7 +3025,7 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
         nm = _cjk_best_substring(m.group(1) or "")
         if not nm or count_cjk(nm) < 2:
             continue
-        t = _to_float(m.group(2))
+        t = validate_time_seconds(_to_float(m.group(2)))
         if t is None:
             continue
         entries.append((m.start(), nm, t))
