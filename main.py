@@ -757,7 +757,7 @@ def crop_within(parent_crop: np.ndarray, rel_roi: list[float]) -> np.ndarray:
 # =============================================================================
 # Pre-processing
 # =============================================================================
-def enhance_contrast_grayscale(image_bgr: np.ndarray) -> np.ndarray:
+def enhance_contrast_grayscale(image_bgr: np.ndarray, *, blur: bool = True) -> np.ndarray:
     """
     Convert BGR -> grayscale and enhance local contrast for OCR.
 
@@ -773,11 +773,80 @@ def enhance_contrast_grayscale(image_bgr: np.ndarray) -> np.ndarray:
       - Preprocessed grayscale image (np.ndarray).
 
     Notes:
-      - Applies CLAHE (adaptive histogram equalization) + mild Gaussian blur.
+      - Applies CLAHE (adaptive histogram equalization) and, by default, a mild Gaussian blur.
     """
     g = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     g = _CLAHE.apply(g)
-    return cv2.GaussianBlur(g, (3, 3), 0)
+    if blur:
+        return cv2.GaussianBlur(g, (3, 3), 0)
+    return g
+
+
+def laplacian_variance(image: np.ndarray) -> float:
+    """
+    Estimate edge energy via the variance of the Laplacian.
+
+    Purpose:
+      - Provide a cheap blur/definition heuristic for HUD ROIs.
+      - Trigger stronger OCR preprocessing only when the crop looks soft.
+    """
+    if image is None or image.size == 0:
+        return 0.0
+    g = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    try:
+        return float(cv2.Laplacian(g, cv2.CV_32F).var())
+    except Exception:
+        return 0.0
+
+
+def use_aggressive_latin_variants(roi_bgr: np.ndarray) -> bool:
+    """
+    Decide whether a Latin HUD ROI deserves stronger OCR preprocessing.
+
+    Purpose:
+      - Keep the normal path cheap on clean captures.
+      - Spend extra work on tiny or blurry text regions.
+    """
+    if roi_bgr is None or roi_bgr.size == 0:
+        return False
+    h, w = roi_bgr.shape[:2]
+    min_side = min(h, w)
+    edge_energy = laplacian_variance(roi_bgr)
+    if min_side <= 70:
+        return True
+    if min_side <= 110:
+        return edge_energy < 95.0
+    return edge_energy < 70.0
+
+
+def ocr_lines_have_signal(lines: list[tuple[str, float]], *, min_chars: int = 4) -> bool:
+    """
+    Decide whether a first OCR pass already contains enough usable signal.
+
+    Purpose:
+      - Short-circuit expensive fallback variants on clean captures.
+      - Keep the enhanced OCR path focused on weak/empty first-pass results.
+    """
+    if not lines:
+        return False
+
+    texts = [t.strip() for t, _ in lines if (t or "").strip()]
+    if not texts:
+        return False
+
+    compact = re.sub(RE_SPACES, "", " ".join(texts))
+    total_chars = len(compact)
+    confs = [float(c or 0.0) for _, c in lines]
+    max_conf = max(confs) if confs else 0.0
+    avg_conf = float(np.mean(confs)) if confs else 0.0
+
+    if total_chars >= 12:
+        return True
+    if total_chars >= min_chars and max_conf >= 0.72:
+        return True
+    if total_chars >= max(6, min_chars) and avg_conf >= 0.58:
+        return True
+    return False
 
 
 def mask_white_regions(image_bgr: np.ndarray) -> np.ndarray:
@@ -900,6 +969,90 @@ def upscale(image_bgr: np.ndarray, scale: float) -> np.ndarray:
       - Uses INTER_CUBIC for smoother edges.
     """
     return cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+
+def build_latin_hud_variants(roi_bgr: np.ndarray) -> list[np.ndarray]:
+    """
+    Build OCR variants for small Latin HUD text (names/times/TOP5).
+
+    Purpose:
+      - Recover thin ASCII text from blurry or compressed screenshots.
+      - Reuse the same targeted preprocess stack across top-left, bottom-left, and TOP5.
+    """
+    if roi_bgr is None or roi_bgr.size == 0:
+        return []
+
+    variants: list[np.ndarray] = []
+    base = roi_bgr
+    variants.append(base)
+
+    h, w = base.shape[:2]
+    aggressive = use_aggressive_latin_variants(base)
+    scale = 3.0 if min(h, w) < 110 else (2.6 if aggressive else 2.0)
+
+    up = upscale(base, scale)
+    up = unsharp(up, amount=1.9 if aggressive else 1.6, sigma=0.9 if aggressive else 1.0)
+    variants.append(up)
+
+    white = mask_white_regions(base)
+    variants.append(white)
+
+    hud = mask_hud_cyan_regions(base)
+    variants.append(hud)
+
+    gray = enhance_contrast_grayscale(base, blur=not aggressive)
+    if FAST_OCR:
+        if aggressive:
+            variants.append(gray)
+            white_up = cv2.resize(white, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+            variants.append(cv2.dilate(white_up, _KERNEL_3, iterations=1))
+        return variants
+
+    variants.append(gray)
+
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7)
+    variants.append(thr)
+    variants.append(255 - thr)
+
+    if aggressive:
+        white_up = cv2.resize(white, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+        variants.append(cv2.dilate(white_up, _KERNEL_3, iterations=1))
+
+        hud_up = cv2.resize(hud, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+        variants.append(cv2.dilate(hud_up, _KERNEL_3, iterations=1))
+
+        gray_up = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        variants.append(gray_up)
+
+    return variants
+
+
+def ocr_lines_latin_hud(
+    roi_bgr: np.ndarray,
+    cache: dict[tuple[str, int, tuple[int, ...]], list[tuple[str, float]]],
+) -> list[tuple[str, float]]:
+    """
+    OCR a Latin HUD ROI using focused preprocessing variants.
+
+    Purpose:
+      - Centralize the enhanced EN OCR path for small HUD text.
+      - Keep callers simple while reusing the same variant set.
+    """
+    if roi_bgr is None or roi_bgr.size == 0:
+        return []
+
+    base_lines = ocr_lines_cached(roi_bgr, "en", cache)
+    aggressive = use_aggressive_latin_variants(roi_bgr)
+    if ocr_lines_have_signal(base_lines, min_chars=4) and not aggressive:
+        return base_lines
+
+    lines: list[tuple[str, float]] = list(base_lines)
+    variants = build_latin_hud_variants(roi_bgr)
+    for variant in variants[1:]:
+        lines.extend(ocr_lines_cached(variant, "en", cache))
+        if not aggressive and ocr_lines_have_signal(lines, min_chars=4):
+            break
+    return lines
 
 
 def build_map_code_variants(roi_bgr: np.ndarray) -> list[np.ndarray]:
@@ -1891,6 +2044,52 @@ def names_match_strict(a: str | None, b: str | None, threshold: float = HINT_MAT
     return name_similarity(a, b) >= threshold
 
 
+def names_match_cjk_aux(a: str | None, b: str | None, threshold: float = 0.80) -> bool:
+    """
+    Auxiliary CJK hint match used for time-backed fallback confirmation.
+
+    Purpose:
+      - Allow a slightly softer confirmation path for blurry CJK name OCR.
+      - Keep the relaxed path scoped to flows already corroborated by other evidence.
+    """
+    if not a or not b:
+        return False
+    if count_cjk(a) < 2 or count_cjk(b) < 2:
+        return False
+    return name_similarity(a, b) >= threshold
+
+
+def names_match_cjk_time_backed(a: str | None, b: str | None) -> bool:
+    """
+    Conservative CJK fallback match for cases already supported by an exact time.
+
+    Purpose:
+      - Recover low-quality leaderboard names where a couple of Han characters are
+        replaced by visually similar ones.
+      - Avoid broadening general hint matching; only use as a last resort.
+    """
+    if not a or not b:
+        return False
+    if count_cjk(a) < 2 or count_cjk(b) < 2:
+        return False
+    if names_match_strict(a, b):
+        return True
+
+    aa = _norm_cjk(a)
+    bb = _norm_cjk(b)
+    if not aa or not bb:
+        return False
+    if len(aa) != len(bb) or len(aa) < 4:
+        return False
+    if aa[0] != bb[0] or aa[-1] != bb[-1]:
+        return False
+
+    same_pos = sum(1 for x, y in zip(aa, bb) if x == y)
+    if same_pos < max(3, len(aa) - 2):
+        return False
+    return _levenshtein_ratio(aa, bb) >= 0.60
+
+
 def _normalize_code_for_compare(code: str) -> str:
     """
     Normalize a map code for fuzzy comparisons.
@@ -2261,7 +2460,7 @@ def extract_name_from_bottom_left(
     for roi in name_rois:
         if roi is None or roi.size == 0:
             continue
-        lines = ocr_lines_cached(roi, "en", cache)
+        lines = ocr_lines_latin_hud(roi, cache)
         text = " ".join(t for t, _ in lines).replace("|", " ")
         tokens = [t for t in re.split(RE_SPACES, (text or "")) if t]
         avg_conf = float(np.mean([c for _, c in lines])) if lines else 0.0
@@ -2351,11 +2550,20 @@ def extract_name_from_bottom_left(
                     score = _score_name_candidate(fake, cjk)
                     cjk_candidates.append((cjk, score))
 
-    _collect_cjk_for_lang("korean")
-    strong_korean = any(build_script_profile(n).hangul >= 0.55 for n, _ in cjk_candidates)
-    if not strong_korean and not FAST_OCR:
-        _collect_cjk_for_lang("japan")
-        _collect_cjk_for_lang("ch")
+    if hint_cjk and name_hint:
+        langs_hint = [lang for lang in _preferred_langs_for_name_hint(name_hint) if lang != "en"]
+        for lang in langs_hint:
+            _collect_cjk_for_lang(lang)
+        if not cjk_candidates and not FAST_OCR:
+            for lang in ("japan", "ch", "korean"):
+                if lang not in langs_hint:
+                    _collect_cjk_for_lang(lang)
+    else:
+        _collect_cjk_for_lang("korean")
+        strong_korean = any(build_script_profile(n).hangul >= 0.55 for n, _ in cjk_candidates)
+        if not strong_korean and not FAST_OCR:
+            _collect_cjk_for_lang("japan")
+            _collect_cjk_for_lang("ch")
 
     picked_cjk = _consensus_pick(cjk_candidates)
     picked_ascii = None
@@ -2701,13 +2909,13 @@ def _preferred_langs_for_name_hint(name_hint: str) -> list[LanguageCode]:
 
     prof = build_script_profile(name_hint)
     if prof.hangul >= max(prof.kana, prof.han):
-        primary: LanguageCode = "korean"
-    elif prof.kana >= prof.han:
-        primary = "japan"
-    else:
-        primary = "ch"
-
-    return [primary, "en"] if primary != "en" else ["en"]
+        return ["korean", "en"]
+    if prof.han > 0 and prof.kana == 0 and prof.hangul == 0:
+        # Pure Han hints are ambiguous between Chinese and Japanese names.
+        return ["japan", "ch", "en"]
+    if prof.kana >= prof.han:
+        return ["japan", "en"]
+    return ["ch", "en"]
 
 
 def extract_confirmed_time_from_banner(
@@ -2787,6 +2995,58 @@ def extract_confirmed_time_from_banner(
     return None, last_text, last_name
 
 
+def extract_top5_names_for_time(top5_text: str, target_time: float | None) -> list[str]:
+    """
+    Extract name candidates whose TOP5 time matches a target time exactly.
+
+    Purpose:
+      - Support conservative fallback confirmation when the OCR time is strong
+        but the OCR name is slightly degraded.
+      - Reuse the existing TOP5 text instead of running another OCR pass.
+    """
+    if not top5_text or target_time is None:
+        return []
+
+    block_upper = (top5_text or "").upper()
+    m_top5 = RE_TOP5_SECTION.search(block_upper)
+    block_upper = block_upper[m_top5.start() :] if m_top5 else block_upper
+    block_upper = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", r"\1\2", block_upper)
+    block_upper = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", block_upper)
+
+    block_raw = top5_text
+    m2 = RE_TOP5_SECTION.search(block_raw)
+    block_raw = block_raw[m2.start() :] if m2 else block_raw
+    block_raw = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", r"\1\2", block_raw)
+    block_raw = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", block_raw)
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for m in re.finditer(RE_TOP5_TIME_FOR_NAME_ASCII, block_upper):
+        t = validate_time_seconds(parse_loose_numeric_token(remove_all_whitespace(m.group(2) or "")))
+        if time_similarity(t, target_time) < HINT_MATCH_THRESHOLD:
+            continue
+        nm = _strip_rank_prefix_ascii((m.group(1) or "").upper())
+        if not nm or nm in _GENERIC_ASCII or not re.fullmatch(RE_ASCII_NAME_MATCH, nm):
+            continue
+        if nm not in seen:
+            seen.add(nm)
+            out.append(nm)
+
+    for m in re.finditer(RE_TOP5_TIME_FOR_NAME_CJK, block_raw):
+        t = validate_time_seconds(parse_loose_numeric_token(remove_all_whitespace(m.group(2) or "")))
+        if time_similarity(t, target_time) < HINT_MATCH_THRESHOLD:
+            continue
+        nm = _cjk_best_substring(m.group(1) or "")
+        if not nm or count_cjk(nm) < 2:
+            continue
+        if nm not in seen:
+            seen.add(nm)
+            out.append(nm)
+
+    return out
+
+
 def extract_top5_text(top_right_crop: np.ndarray, cache: dict) -> tuple[str, str]:
     """
     Extract OCR text from the TOP5 leaderboard area.
@@ -2824,7 +3084,7 @@ def extract_top5_text(top_right_crop: np.ndarray, cache: dict) -> tuple[str, str
         if strip is None or strip.size == 0:
             continue
 
-        top5_lines.extend(ocr_lines_cached(strip, "en", cache))
+        top5_lines.extend(ocr_lines_latin_hud(strip, cache))
 
         # Add a small set of CJK name variants for robustness.
         for v in build_cjk_name_variants(strip):
@@ -2901,10 +3161,42 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
         Returns:
           - float value if parseable, else None.
         """
-        return parse_loose_numeric_token(remove_all_whitespace(s or ""))
+        token = re.sub(RE_SPACES, " ", (s or "")).strip()
+        if not token:
+            return None
+
+        joined = validate_time_seconds(parse_loose_numeric_token(remove_all_whitespace(token)))
+
+        m_split = re.fullmatch(r"(\d{1,2})\s+(\d{1,5}[.,]\d{2})", token)
+        if not m_split:
+            return joined
+
+        suffix = validate_time_seconds(parse_loose_numeric_token(m_split.group(2)))
+        if joined is None:
+            return suffix
+        if suffix is None:
+            return joined
+
+        int_part = re.split(r"[.,]", m_split.group(2), maxsplit=1)[0]
+        int_digits = len(re.sub(r"\D", "", int_part))
+
+        # If the suffix already carries four digits before the decimal separator,
+        # the isolated leading digit(s) are often a leaked leaderboard rank rather
+        # than part of the time
+        if int_digits >= 4:
+            return suffix
+        return joined
 
     def _normalize_top5_time_layout(text: str) -> str:
-        text = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", r"\1\2", text)
+        def _merge_split_time(m) -> str:
+            tail = m.group(2) or ""
+            int_part = re.split(r"[.,]", tail, maxsplit=1)[0]
+            int_digits = len(re.sub(r"\D", "", int_part))
+            if int_digits >= 4:
+                return m.group(0)
+            return f"{m.group(1)}{tail}"
+
+        text = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", _merge_split_time, text)
         return re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", text)
 
     # Normalize and isolate TOP5 block
@@ -2932,6 +3224,9 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
         """
         Internal helper: normalize/validate an ASCII name candidate before adding it.
         """
+        t = validate_time_seconds(t)
+        if t is None:
+            return
         nm = _strip_rank_prefix_ascii(raw_name)
         if not nm or nm in _GENERIC_ASCII:
             return
@@ -2990,7 +3285,7 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
         nm = _cjk_best_substring(m.group(1) or "")
         if not nm or count_cjk(nm) < 2:
             continue
-        t = _to_float(m.group(2))
+        t = validate_time_seconds(_to_float(m.group(2)))
         if t is None:
             continue
         entries.append((m.start(), nm, t))
@@ -3088,15 +3383,7 @@ def extract_confirmed_time_from_top5(
             if strip is None or strip.size == 0:
                 continue
 
-            lines.extend(ocr_lines_cached(strip, "en", cache))
-
-            w = mask_white_regions(strip)
-            if w is not None:
-                lines.extend(ocr_lines_cached(w, "en", cache))
-
-            if not FAST_OCR:
-                g = enhance_contrast_grayscale(strip)
-                lines.extend(ocr_lines_cached(g, "en", cache))
+            lines.extend(ocr_lines_latin_hud(strip, cache))
 
             t = _try_now()
             if t is not None:
@@ -3119,26 +3406,27 @@ def extract_confirmed_time_from_top5(
 
     # CJK: targeted language, limited variants
     langs = _preferred_langs_for_name_hint(name_hint)
-    primary = langs[0] if langs else "korean"
+    primaries = [lang for lang in langs if lang != "en"] or ["korean"]
 
-    for strip in strips:
-        if strip is None or strip.size == 0:
-            continue
+    for primary in primaries:
+        for strip in strips:
+            if strip is None or strip.size == 0:
+                continue
 
-        variants = build_cjk_name_variants(strip)
-        max_v = 4 if FAST_OCR else 6  # hard cap to reduce load
-        for v in variants[:max_v]:
-            lines.extend(ocr_lines_cached(v, primary, cache))
+            variants = build_cjk_name_variants(strip)
+            max_v = 4 if FAST_OCR else 6  # hard cap to reduce load
+            for v in variants[:max_v]:
+                lines.extend(ocr_lines_cached(v, primary, cache))
 
-        t = _try_now()
-        if t is not None:
-            dbg_full = ""
-            if OCR_DEBUG_TEXTS:
-                dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
-            return t, join_lines(lines), dbg_full
+            t = _try_now()
+            if t is not None:
+                dbg_full = ""
+                if OCR_DEBUG_TEXTS:
+                    dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
+                return t, join_lines(lines), dbg_full
 
     # Optional EN fallback if primary didn't find it
-    if "en" in langs and primary != "en":
+    if "en" in langs:
         for strip in strips:
             if strip is None or strip.size == 0:
                 continue
@@ -3153,14 +3441,21 @@ def extract_confirmed_time_from_top5(
     # Fallback: OCR the full top-right ROI using primary language
     variants_full = build_cjk_name_variants(top_right_crop)
     max_v_full = 4 if FAST_OCR else 6
-    for v in variants_full[:max_v_full]:
-        lines.extend(ocr_lines_cached(v, primary, cache))
+    for primary in primaries:
+        for v in variants_full[:max_v_full]:
+            lines.extend(ocr_lines_cached(v, primary, cache))
 
-    t = _try_now()
+        t = _try_now()
+        if t is not None:
+            dbg_full = ""
+            if OCR_DEBUG_TEXTS:
+                dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
+            return t, join_lines(lines), dbg_full
+
     dbg_full = ""
     if OCR_DEBUG_TEXTS:
         dbg_full = join_lines(ocr_lines_cached(top_right_crop, "en", cache))
-    return t, join_lines(lines), dbg_full
+    return None, join_lines(lines), dbg_full
 
 
 # =============================================================================
@@ -3695,6 +3990,7 @@ def run_ocr_pipeline(
     text_top_left_en = ""
     text_top_left_white_en = ""
     text_top_left_cyan_en = ""
+    text_top_left_time_en = ""
     top_left_time: float | None = None
 
     tl_lines: list[tuple[str, float]] = []
@@ -3756,6 +4052,17 @@ def run_ocr_pipeline(
         if map_code_final:
             code_source = "topLeft"
 
+    def _get_top_left_time_text() -> str:
+        nonlocal text_top_left_time_en
+        if text_top_left_time_en:
+            return text_top_left_time_en
+
+        tl_time_lines = list(tl_lines)
+        for variant in build_latin_hud_variants(top_left_wide)[1:]:
+            tl_time_lines.extend(ocr_lines_cached(variant, "en", cache))
+        text_top_left_time_en = join_lines(tl_time_lines)
+        return text_top_left_time_en
+
     # -------------------------------------------------------------------------
     # FLOW A: name(s) provided -> Banner (strict) then TOP5 (strict)
     #   + If time hint is provided, time must match ABSOLUTELY (via time_similarity/HINT_TIME_ABS_TOL)
@@ -3801,8 +4108,21 @@ def run_ocr_pipeline(
                 text_top_left_white_en = (
                     join_lines(ocr_lines_cached(tl_white_mask, "en", cache)) if tl_white_mask is not None else ""
                 )
-            top_left_time = extract_time_from_top_left(text_top_left_en, text_top_left_white_en)
+            top_left_time = extract_time_from_top_left(_get_top_left_time_text(), text_top_left_white_en)
             return top_left_time
+
+        def _confirm_name_from_bottom_left(name_hint: str) -> bool:
+            bl_hint = extract_name_from_bottom_left(
+                bottom_left_name,
+                bottom_left,
+                cache=cache,
+                name_hint=name_hint,
+            )
+            if not bl_hint:
+                return False
+            if names_match_strict(bl_hint, name_hint):
+                return True
+            return names_match_cjk_aux(bl_hint, name_hint)
 
         for name_hint in names_to_try:
             # 1) Banner-confirmed time first (name is STRICTLY confirmed inside)
@@ -3858,15 +4178,28 @@ def run_ocr_pipeline(
                         time_source = "topRight.top5"
                     break
 
+            # 2b) Conservative CJK fallback: if TOP5 shows the exact hinted time,
+            # allow a visually-close CJK OCR name to count only as "name confirmed".
+            if time_hint_valid is not None and first_confirmed_name is None and count_cjk(name_hint) >= 2:
+                top5_names_at_hint_time = extract_top5_names_for_time(top5_text, time_hint_valid)
+                if any(names_match_cjk_time_backed(nm, name_hint) for nm in top5_names_at_hint_time):
+                    first_confirmed_name = name_hint
+
         # If banner/top5 confirmed the name but not the hinted time, allow the
         # top-left timer to corroborate the same hint before returning unconfirmed.
         if time_hint_valid is not None and seconds is None:
+            if first_confirmed_name is None:
+                for name_hint in names_to_try:
+                    if _confirm_name_from_bottom_left(name_hint):
+                        first_confirmed_name = name_hint
+                        break
+
             if not text_top_left_white_en:
                 tl_white_mask = mask_white_regions(top_left_wide)
                 text_top_left_white_en = (
                     join_lines(ocr_lines_cached(tl_white_mask, "en", cache)) if tl_white_mask is not None else ""
                 )
-            top_left_time = extract_time_from_top_left(text_top_left_en, text_top_left_white_en)
+            top_left_time = extract_time_from_top_left(_get_top_left_time_text(), text_top_left_white_en)
 
             if first_confirmed_name and _time_hint_matches(top_left_time):
                 picked_name = first_confirmed_name
@@ -3915,7 +4248,7 @@ def run_ocr_pipeline(
     if not text_top_left_white_en:
         tl_white_mask = mask_white_regions(top_left_wide)
         text_top_left_white_en = join_lines(ocr_lines_cached(tl_white_mask, "en", cache)) if tl_white_mask is not None else ""
-    top_left_time = extract_time_from_top_left(text_top_left_en, text_top_left_white_en)
+    top_left_time = extract_time_from_top_left(_get_top_left_time_text(), text_top_left_white_en)
 
     # ---- NAME (BL) ----
     bl_name = extract_name_from_bottom_left(
