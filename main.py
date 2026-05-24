@@ -102,6 +102,7 @@ OCR_TRUST_HINTS = _env_bool("OCR_TRUST_HINTS", default=False)  # allow using hin
 # Hint matching: prefer provided hint only when it matches OCR at this threshold.
 HINT_MATCH_THRESHOLD = float(os.environ.get("HINT_MATCH_THRESHOLD", "0.90"))
 HINT_TIME_ABS_TOL = float(os.environ.get("HINT_TIME_ABS_TOL", "0"))
+MIN_VALID_TIME_SECONDS = float(os.environ.get("MIN_VALID_TIME_SECONDS", "10.0"))
 
 # Avoid thread oversubscription (OpenCV/OpenBLAS) and configure OMP/oneDNN threads.
 os.environ.setdefault("CPU_RUNTIME_CACHE_CAPACITY", "20")
@@ -243,13 +244,13 @@ class ApiResponse(CamelModel):
 ROI_TOPLEFT = [0.010, 0.020, 0.360, 0.300]
 ROI_TOPLEFT_WIDE = [0.005, 0.010, 0.420, 0.340]
 ROI_BANNER_TIGHT = [0.240, 0.083, 0.760, 0.557]
-ROI_TOPRIGHT = [0.821, 0.077, 0.985, 0.664]
+ROI_TOPRIGHT = [0.821, 0.077, 0.990, 0.730]
 ROI_BOTTOMLEFT = [0.050, 0.825, 0.330, 0.990]
 
 # TOP5 strip inside ROI_TOPRIGHT (to avoid "HOLD ... LEADERBOARD" junk)
 ROI_TR_TOP5_STRIP_0 = [0.02, 0.18, 1.00, 0.62]
-ROI_TR_TOP5_STRIP_1 = [0.22, 0.50, 1.00, 0.78]
-ROI_TR_TOP5_STRIP_2 = [0.16, 0.48, 1.00, 0.82]
+ROI_TR_TOP5_STRIP_1 = [0.22, 0.50, 1.00, 0.80]
+ROI_TR_TOP5_STRIP_2 = [0.16, 0.58, 1.00, 0.98]
 
 # =============================================================================
 # Regex / parsing
@@ -258,7 +259,8 @@ RE_SPACES = re.compile(r"\s+")
 RE_DIGITS_LOOSE_CLEANUP1 = re.compile(r"[^\d\.,]")
 RE_DIGITS_LOOSE_CLEANUP2 = re.compile(r"(\d{1,5}\.\d{2})")
 
-RE_PARSE_TIME_AGAIN = re.compile(r"(?<![0-9.,])(\d{1,5}[.,]\d{2})\s*SEC", re.IGNORECASE)
+RE_TIME_TOKEN_PATTERN = r"[0-9OQDBZGISL]{1,5}[.,:][0-9OQDBZGISL]{2}"
+RE_PARSE_TIME_AGAIN = re.compile(rf"(?<![0-9.,])({RE_TIME_TOKEN_PATTERN})\s*SEC", re.IGNORECASE)
 RE_PARSE_TOPLEFT_TIME_ANY = re.compile(r"(?<![0-9.,])(\d{1,5}[.,]\d{2})\s*(?:SEC|초)?", re.IGNORECASE)
 
 RE_PARSE_BANNER_TIME_SEARCH_WITH_SEC = re.compile(r"([0-9OQDBZGISL\,\.]{3,12})\s*(?:SEC|초)?")
@@ -291,6 +293,15 @@ RE_CJK_CHAR = re.compile(f"[{_CJK_ALL}]")
 RE_CJK_SEQ = re.compile(rf"([{_CJK_ALL}]{{2,40}})")
 RE_TOP5_TIME_FOR_NAME_CJK = re.compile(
     rf"([{_CJK_ALL}]{{2,40}})\s+(\d{{1,5}}[.,]\d{{2}})\s*(?:SEC|초)?",
+    re.IGNORECASE,
+)
+
+RE_TOP5_TIME_FOR_NAME_ASCII = re.compile(
+    rf"\b([A-Z][A-Z0-9_]{{2,24}})\b\s+({RE_TIME_TOKEN_PATTERN})\s*(?:SEC)?",
+    re.IGNORECASE,
+)
+RE_TOP5_TIME_FOR_NAME_CJK = re.compile(
+    rf"([{_CJK_ALL}]{{2,40}})\s+({RE_TIME_TOKEN_PATTERN})\s*(?:SEC)?",
     re.IGNORECASE,
 )
 
@@ -2044,6 +2055,118 @@ def names_match_strict(a: str | None, b: str | None, threshold: float = HINT_MAT
     return name_similarity(a, b) >= threshold
 
 
+def text_contains_name_hint(text: str | None, name_hint: str | None) -> bool:
+    """
+    Confirm a provided name hint directly from OCR text.
+
+    This is used only as a fallback after region-specific parsers have run. It
+    keeps ASCII matching token-bounded so short names do not match inside UI
+    words, while CJK names use normalized containment.
+    """
+    if not text or not name_hint:
+        return False
+
+    hint = name_hint.strip()
+    if not hint:
+        return False
+
+    if count_cjk(hint) >= 2:
+        haystack = _norm_cjk(text)
+        needle = _norm_cjk(hint)
+        if haystack and needle and needle in haystack:
+            return True
+
+        hint_len = len(needle)
+        if hint_len < 2:
+            return False
+
+        for seq_match in re.finditer(RE_CJK_SEQ, text):
+            seq = _norm_cjk(seq_match.group(0) or "")
+            if not seq:
+                continue
+            min_len = max(2, hint_len - 2)
+            max_len = min(len(seq), hint_len + 3)
+            for size in range(min_len, max_len + 1):
+                for start in range(0, len(seq) - size + 1):
+                    if name_similarity(seq[start : start + size], needle) >= 0.80:
+                        return True
+            if name_similarity(seq, needle) >= 0.80:
+                return True
+
+        return False
+
+    needle = _clean_ascii_token(hint)
+    if not needle or not re.fullmatch(RE_ASCII_NAME_MATCH, needle):
+        return False
+
+    return re.search(rf"(?<![A-Z0-9_]){re.escape(needle)}(?![A-Z0-9_])", text.upper()) is not None
+
+
+def extract_time_after_name_hint_from_text(text: str | None, name_hint: str | None) -> float | None:
+    """
+    Extract a time that appears immediately after an exact provided name hint.
+
+    This is intentionally narrow and is used for TOP5 hint validation: the OCR
+    must contain the exact ASCII hint token followed shortly by a time token.
+    """
+    if not text or not name_hint:
+        return None
+
+    normalized_text = text.upper()
+    normalized_text = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", r"\1\2", normalized_text)
+    normalized_text = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", normalized_text)
+
+    def _parse_after(end_pos: int) -> float | None:
+        after = normalized_text[end_pos : end_pos + 48]
+        mt = re.search(rf"({RE_TIME_TOKEN_PATTERN})\s*(?:SEC)?", after, re.IGNORECASE)
+        if not mt:
+            return None
+        return validate_time_seconds(parse_loose_numeric_token(mt.group(1)))
+
+    if count_cjk(name_hint) >= 2:
+        for m in re.finditer(RE_CJK_SEQ, normalized_text):
+            if not text_contains_name_hint(m.group(0), name_hint):
+                continue
+            t = _parse_after(m.end())
+            if t is not None:
+                return t
+        return None
+
+    target = _clean_ascii_token(name_hint)
+    if not target or not re.fullmatch(RE_ASCII_NAME_MATCH, target):
+        return None
+
+    for m in re.finditer(rf"(?<![A-Z0-9_]){re.escape(target)}(?![A-Z0-9_])", normalized_text):
+        t = _parse_after(m.end())
+        if t is not None:
+            return t
+
+    return None
+
+
+def text_contains_time_hint(text: str | None, time_hint: float | None) -> bool:
+    """
+    Return True when OCR text contains a time token matching the provided hint.
+
+    This checks every visible time-like token instead of trusting the first OCR
+    hit, which can be wrong in masks while the raw OCR line is correct.
+    """
+    hinted = validate_time_seconds(time_hint)
+    if not text or hinted is None:
+        return False
+
+    normalized = (text or "").upper()
+    normalized = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,:]\d{2})(?!\d)", r"\1\2", normalized)
+    normalized = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", normalized)
+
+    for m in re.finditer(RE_TIME_TOKEN_PATTERN, normalized, re.IGNORECASE):
+        candidate = validate_time_seconds(parse_loose_numeric_token(m.group(0)))
+        if time_similarity(candidate, hinted) >= HINT_MATCH_THRESHOLD:
+            return True
+
+    return False
+
+
 def names_match_cjk_aux(a: str | None, b: str | None, threshold: float = 0.80) -> bool:
     """
     Auxiliary CJK hint match used for time-backed fallback confirmation.
@@ -2732,7 +2855,7 @@ def parse_loose_numeric_token(raw_token: str) -> float | None:
         .replace("Z", "2")
         .replace("G", "6")
     )
-    normalized = re.sub(RE_DIGITS_LOOSE_CLEANUP1, "", normalized).replace(",", ".")
+    normalized = re.sub(RE_DIGITS_LOOSE_CLEANUP1, "", normalized.replace(":", ".")).replace(",", ".")
     res = re.search(RE_DIGITS_LOOSE_CLEANUP2, normalized)
     return float(res.group(1)) if res else None
 
@@ -2858,7 +2981,7 @@ def validate_time_seconds(t: float | None) -> float | None:
       - Rounded time (2 decimals) if valid, else None.
 
     Notes:
-      - Current constraints discard values < 30.0 and > 15360 (4h 16m).
+      - Current constraints discard values below MIN_VALID_TIME_SECONDS and > 15360 (4h 16m).
       - Keeps rounding consistent with API output and hint comparison.
     """
     if t is None:
@@ -2868,7 +2991,7 @@ def validate_time_seconds(t: float | None) -> float | None:
     except Exception:
         return None
     # Discard implausible values
-    if v < 30.0:
+    if v < MIN_VALID_TIME_SECONDS:
         return None
     if v > 15360:
         return None
@@ -3210,6 +3333,10 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
     block_raw = block_raw[m2.start() :] if m2 else block_raw
     block_raw = _normalize_top5_time_layout(block_raw)
 
+    hinted_direct_time = extract_time_after_name_hint_from_text(block_upper, target_name)
+    if hinted_direct_time is not None:
+        return hinted_direct_time
+
     entries: list[tuple[int, str, float]] = []
     re_top5_time_for_name_ascii = re.compile(
         r"\b([A-Z][A-Z0-9_]{2,24})\b(?:\s*[-:|]\s*|\s+)((?:\d{1,2}\s+)?\d{1,5}[.,]\d{2})\s*(?:SEC|ì´ˆ)?",
@@ -3217,6 +3344,15 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
     )
     re_top5_time_for_name_cjk = re.compile(
         rf"([{_CJK_ALL}]{{2,40}})(?:\s*[-:|]\s*|\s+)((?:\d{{1,2}}\s+)?\d{{1,5}}[.,]\d{{2}})\s*(?:SEC|ì´ˆ)?",
+        re.IGNORECASE,
+    )
+
+    re_top5_time_for_name_ascii = re.compile(
+        rf"\b([A-Z][A-Z0-9_]{{2,24}})\b(?:\s*[-:|]\s*|\s+)((?:[0-9OQDBZGISL]{{1,2}}\s+)?{RE_TIME_TOKEN_PATTERN})\s*(?:SEC)?",
+        re.IGNORECASE,
+    )
+    re_top5_time_for_name_cjk = re.compile(
+        rf"([{_CJK_ALL}]{{2,40}})(?:\s*[-:|]\s*|\s+)((?:[0-9OQDBZGISL]{{1,2}}\s+)?{RE_TIME_TOKEN_PATTERN})\s*(?:SEC)?",
         re.IGNORECASE,
     )
 
@@ -3248,6 +3384,10 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
     # similarity scoring decide the best candidate.
     re_time_any = re.compile(r"(?<![0-9.,])(\d{1,5}[.,]\d{2})\s*(?:SEC|ì´ˆ)?", re.IGNORECASE)
     re_time_any = re.compile(r"(?<![0-9.,])((?:\d{1,2}\s+)?\d{1,5}[.,]\d{2})\s*(?:SEC|ÃƒÂ¬Ã‚Â´Ã‹â€ |Ã¬Â´Ë†)?", re.IGNORECASE)
+    re_time_any = re.compile(
+        rf"(?<![0-9.,])((?:[0-9OQDBZGISL]{{1,2}}\s+)?{RE_TIME_TOKEN_PATTERN})\s*(?:SEC)?",
+        re.IGNORECASE,
+    )
     re_ascii_chunk = re.compile(r"[A-Z0-9_]{2,24}")
     noise_tokens = _GENERIC_ASCII | {
         "TOP5",
@@ -3549,6 +3689,7 @@ def normalize_map_code(raw_code_text: str | None, require_digit: bool = True) ->
         "LEVEL",
         "TOP",
         "PLAYTEST",
+        "CLASS",
         "CODE",
         "C0DE",
         "BH0P",
@@ -3698,6 +3839,7 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
             "LEVEL",
             "TOP",
             "PLAYTEST",
+            "CLASS",
             "CODE",
             "C0DE",
             "AUTO",
@@ -3748,6 +3890,43 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
         ),
     )
     return best_code
+
+
+def extract_provided_code_from_texts(texts: list[str], provided_code: str | None) -> str | None:
+    """
+    Confirm a provided map code from OCR text even when the local label is noisy.
+
+    Korean HUD labels such as "맵 코드" can be OCR'd as unrelated Latin words
+    like "CLASS Q35", so this fallback looks for the provided code token itself
+    in the top-left OCR output instead of relying on the label.
+    """
+    provided = normalize_map_code(provided_code, require_digit=False)
+    if not provided:
+        return None
+
+    provided_cmp = _normalize_code_for_compare(provided)
+    provided_len = len(provided_cmp)
+    if not (4 <= provided_len <= 6):
+        return None
+
+    for text in texts:
+        text_up = (text or "").upper()
+        if not text_up.strip():
+            continue
+
+        for m in re.finditer(r"[A-Z0-9]{4,10}", text_up):
+            token = m.group(0)
+            token_cmp = _normalize_code_for_compare(token)
+            if code_similarity(provided_cmp, token_cmp) >= HINT_MATCH_THRESHOLD:
+                return provided
+
+            if len(token_cmp) > provided_len:
+                for i in range(0, len(token_cmp) - provided_len + 1):
+                    part = token_cmp[i : i + provided_len]
+                    if code_similarity(provided_cmp, part) >= HINT_MATCH_THRESHOLD:
+                        return provided
+
+    return None
 
 
 def extract_code_from_code_variants(
@@ -4032,6 +4211,14 @@ def run_ocr_pipeline(
             elif any(ch.isdigit() for ch in refined_map_code) and not any(ch.isdigit() for ch in map_code):
                 map_code = refined_map_code
 
+    if code_hint_norm and (map_code is None or code_similarity(code_hint_norm, map_code) < HINT_MATCH_THRESHOLD):
+        corroborated_code = extract_provided_code_from_texts(
+            [text_top_left_en, text_top_left_white_en, text_top_left_cyan_en],
+            code_hint_norm,
+        )
+        if corroborated_code:
+            map_code = corroborated_code
+
     # Apply code hint preference (compare OCR vs provided)
     map_code_final = prefer_provided_code(map_code, code)
 
@@ -4131,6 +4318,11 @@ def run_ocr_pipeline(
                 cache,
                 name_hint=name_hint,
             )
+            if first_confirmed_name is None:
+                if (banner_name and names_match_strict(banner_name, name_hint)) or text_contains_name_hint(
+                    text_banner, name_hint
+                ):
+                    first_confirmed_name = name_hint
             if banner_time_confirmed is not None:
                 # Name is confirmed here.
                 if first_confirmed_name is None:
@@ -4155,6 +4347,8 @@ def run_ocr_pipeline(
                 cache,
                 name_hint=name_hint,
             )
+            if first_confirmed_name is None and text_contains_name_hint(top5_text, name_hint):
+                first_confirmed_name = name_hint
             if top5_time_confirmed is not None:
                 if first_confirmed_name is None:
                     first_confirmed_name = name_hint
@@ -4178,12 +4372,37 @@ def run_ocr_pipeline(
                         time_source = "topRight.top5"
                     break
 
+            direct_top5_time = extract_time_after_name_hint_from_text(top5_text, name_hint)
+            if direct_top5_time is not None:
+                if first_confirmed_name is None:
+                    first_confirmed_name = name_hint
+
+                if time_hint_valid is not None:
+                    tl_for_validation = _get_top_left_time_for_validation()
+                    if is_likely_leading_digit_truncation(direct_top5_time, tl_for_validation):
+                        continue
+
+                if _time_hint_matches(direct_top5_time):
+                    picked_name = name_hint
+                    if time_hint_valid is not None:
+                        seconds = time_hint_valid
+                        time_source = "hint"
+                        time_verified_by = "topRight.top5"
+                    else:
+                        seconds = validate_time_seconds(direct_top5_time)
+                        time_source = "topRight.top5"
+                    break
+
             # 2b) Conservative CJK fallback: if TOP5 shows the exact hinted time,
             # allow a visually-close CJK OCR name to count only as "name confirmed".
             if time_hint_valid is not None and first_confirmed_name is None and count_cjk(name_hint) >= 2:
                 top5_names_at_hint_time = extract_top5_names_for_time(top5_text, time_hint_valid)
                 if any(names_match_cjk_time_backed(nm, name_hint) for nm in top5_names_at_hint_time):
                     first_confirmed_name = name_hint
+
+        if picked_name is None and first_confirmed_name is not None and time_hint_valid is None:
+            picked_name = first_confirmed_name
+            time_source = "unconfirmed"
 
         # If banner/top5 confirmed the name but not the hinted time, allow the
         # top-left timer to corroborate the same hint before returning unconfirmed.
@@ -4194,6 +4413,20 @@ def run_ocr_pipeline(
                         first_confirmed_name = name_hint
                         break
 
+            if first_confirmed_name and any(
+                text_contains_time_hint(txt, time_hint_valid)
+                for txt in (top5_text, text_banner, text_top_left_en, text_top_left_white_en)
+            ):
+                picked_name = first_confirmed_name
+                seconds = time_hint_valid
+                time_source = "hint"
+                time_verified_by = "ocrText"
+            else:
+                picked_name = first_confirmed_name
+                seconds = None
+                time_source = "unconfirmed"
+
+        if time_hint_valid is not None and seconds is None:
             if not text_top_left_white_en:
                 tl_white_mask = mask_white_regions(top_left_wide)
                 text_top_left_white_en = (
