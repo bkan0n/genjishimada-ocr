@@ -99,7 +99,8 @@ OCR_DEBUG_TEXTS = _env_bool("OCR_DEBUG_TEXTS", default=False)  # expensive debug
 ACCURATE_OCR = _env_bool("ACCURATE_OCR", default=False)  # if True, run banner/top5 even if TL time found
 OCR_TRUST_HINTS = _env_bool("OCR_TRUST_HINTS", default=False)  # allow using hints as fallback if OCR fails
 
-# Hint matching: prefer provided hint only when it matches OCR at this threshold.
+# General hint matching for names and times. Map codes add a narrowly scoped
+# visual-confusion rule without weakening this threshold.
 HINT_MATCH_THRESHOLD = float(os.environ.get("HINT_MATCH_THRESHOLD", "0.90"))
 HINT_TIME_ABS_TOL = float(os.environ.get("HINT_TIME_ABS_TOL", "0"))
 MIN_VALID_TIME_SECONDS = float(os.environ.get("MIN_VALID_TIME_SECONDS", "10.0"))
@@ -274,13 +275,28 @@ RE_TOP5_TIME_FOR_NAME_ASCII = re.compile(
     re.IGNORECASE,
 )
 
-RE_CODE_KEYWORD_EXTRACT = re.compile(r"(?:MAP\s+)?C(?:O|0)?DE\s*[:\-]?\s*([A-Z0-9]{4,6})\b", re.IGNORECASE)
+RE_CODE_KEYWORD_EXTRACT = re.compile(
+    r"(?:MAP\s+)?C(?:O|0)?DE\s*[:\-]?\s*"
+    r"([A-Z0-9]{4,6}|[A-Z0-9]{1,4}\s+[A-Z0-9]{1,4})\b",
+    re.IGNORECASE,
+)
 RE_CODE_AFTER_COLON = re.compile(r":\s*([A-Z0-9]{4,6})\b", re.IGNORECASE)
+RE_NON_CODE_FIELD_BEFORE_COLON = re.compile(r"(?:MADE\s+BY|DISCORD|TIME|SPLIT)\s*$", re.IGNORECASE)
 RE_MAP_CODE_FIND = re.compile(r"\b[A-Z0-9]{4,6}\b")
 RE_BASIC_NORMALIZATION = re.compile(r"[^A-Z0-9]")
 RE_MAP_CODE_NORMALIZATION = re.compile(r"MAP\s*[CLO0][O0D]{2}E", flags=re.IGNORECASE)
 
 RE_ASCII_NAME_MATCH = re.compile(r"[A-Z][A-Z0-9_]{2,23}")
+
+# A map-code hint is allowed to repair one character only when PaddleOCR made a
+# known visual substitution. Keep this separate from the global hint threshold:
+# one substitution in a five-character code has a ratio of 0.8, while lowering
+# HINT_MATCH_THRESHOLD would also weaken name and time validation.
+_MAP_CODE_VISUAL_CONFUSIONS = {
+    frozenset(("D", "0")),
+    frozenset(("2", "7")),
+    frozenset(("A", "7")),
+}
 
 # CJK ranges
 _HANGUL = r"\uAC00-\uD7A3\u1100-\u11FF\u3130-\u318F"
@@ -2112,9 +2128,7 @@ def extract_time_after_name_hint_from_text(text: str | None, name_hint: str | No
     if not text or not name_hint:
         return None
 
-    normalized_text = text.upper()
-    normalized_text = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", r"\1\2", normalized_text)
-    normalized_text = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", normalized_text)
+    normalized_text = normalize_split_time_layout(text.upper())
 
     def _parse_after(end_pos: int) -> float | None:
         after = normalized_text[end_pos : end_pos + 48]
@@ -2155,9 +2169,7 @@ def text_contains_time_hint(text: str | None, time_hint: float | None) -> bool:
     if not text or hinted is None:
         return False
 
-    normalized = (text or "").upper()
-    normalized = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,:]\d{2})(?!\d)", r"\1\2", normalized)
-    normalized = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", normalized)
+    normalized = normalize_split_time_layout((text or "").upper())
 
     for m in re.finditer(RE_TIME_TOKEN_PATTERN, normalized, re.IGNORECASE):
         candidate = validate_time_seconds(parse_loose_numeric_token(m.group(0)))
@@ -2277,6 +2289,28 @@ def code_similarity(a: str | None, b: str | None) -> float:
     if aa == bb:
         return 1.0
     return max(_levenshtein_ratio(aa, bb), _sim(aa, bb))
+
+
+def codes_match_for_hint(extracted_code: str | None, provided_code: str | None) -> bool:
+    """Return whether top-left OCR safely corroborates a provided map code.
+
+    Exact matches and matches covered by the normal OCR-confusion mapping retain
+    the normal strict threshold. Five-character workshop codes may additionally
+    differ at one position when that position is a known visual confusion. This
+    deliberately does not act as a general fuzzy matcher.
+    """
+    if not extracted_code or not provided_code:
+        return False
+    if code_similarity(extracted_code, provided_code) >= HINT_MATCH_THRESHOLD:
+        return True
+
+    extracted = _normalize_code_for_compare(extracted_code)
+    provided = _normalize_code_for_compare(provided_code)
+    if len(extracted) != 5 or len(provided) != 5:
+        return False
+
+    differences = [(a, b) for a, b in zip(extracted, provided) if a != b]
+    return len(differences) == 1 and frozenset(differences[0]) in _MAP_CODE_VISUAL_CONFUSIONS
 
 
 def time_similarity(extracted: float | None, hinted: float | None) -> float:
@@ -2823,6 +2857,38 @@ def names_match(a: str | None, b: str | None) -> bool:
 # =============================================================================
 # TIME parsing helpers
 # =============================================================================
+def normalize_split_time_layout(text: str) -> str:
+    """Normalize OCR-split time tokens without consuming digits from names.
+
+    Leaderboard OCR can render ``1107.23`` as ``1 107.23`` or ``425.01`` as
+    ``425 01``. The alphanumeric boundaries are important: with a digit-suffixed
+    player name, a digit-only boundary would turn ``PLAYER44 425.01`` into
+    ``PLAYER44425.01`` and make both the name and time impossible to confirm.
+    """
+
+    def _merge_leading_fragment(match: re.Match) -> str:
+        suffix = match.group(2) or ""
+        integer_part = re.split(r"[.,:]", suffix, maxsplit=1)[0]
+        if len(re.sub(r"\D", "", integer_part)) >= 4:
+            # An isolated digit before an already four-digit time is commonly a
+            # leaderboard rank, not a dropped leading time digit.
+            return match.group(0)
+        return f"{match.group(1)}{suffix}"
+
+    normalized = re.sub(
+        r"(?<!\w)(\d{1,2})\s+(\d{3,4}[.,:]\d{2})(?!\w)",
+        _merge_leading_fragment,
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"(?<!\w)(\d{1,5})\s+(\d{2})(?!\w)",
+        r"\1.\2",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+
 def parse_loose_numeric_token(raw_token: str) -> float | None:
     """
     Parse a noisy OCR numeric token into a float.
@@ -2949,10 +3015,9 @@ def extract_time_from_top_left(text_top_left: str, text_top_left_white: str) -> 
     src = re.sub(r"(\d{1,5})\s*[,\s]\s*(\d{1,2})", r"\1.\2", src)
     m = re.search(RE_PARSE_TIME_AGAIN, src)
     if m:
-        try:
-            return float(m.group(1).replace(",", "."))
-        except Exception:
-            return None
+        parsed = validate_time_seconds(parse_loose_numeric_token(m.group(1)))
+        if parsed is not None:
+            return parsed
 
     values: list[float] = []
     for m2 in re.finditer(RE_PARSE_TOPLEFT_TIME_ANY, src):
@@ -3133,14 +3198,12 @@ def extract_top5_names_for_time(top5_text: str, target_time: float | None) -> li
     block_upper = (top5_text or "").upper()
     m_top5 = RE_TOP5_SECTION.search(block_upper)
     block_upper = block_upper[m_top5.start() :] if m_top5 else block_upper
-    block_upper = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", r"\1\2", block_upper)
-    block_upper = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", block_upper)
+    block_upper = normalize_split_time_layout(block_upper)
 
     block_raw = top5_text
     m2 = RE_TOP5_SECTION.search(block_raw)
     block_raw = block_raw[m2.start() :] if m2 else block_raw
-    block_raw = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", r"\1\2", block_raw)
-    block_raw = re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", block_raw)
+    block_raw = normalize_split_time_layout(block_raw)
 
     out: list[str] = []
     seen: set[str] = set()
@@ -3310,28 +3373,16 @@ def extract_time_from_top5(top5_text: str, target_name: str | None, *, min_simil
             return suffix
         return joined
 
-    def _normalize_top5_time_layout(text: str) -> str:
-        def _merge_split_time(m) -> str:
-            tail = m.group(2) or ""
-            int_part = re.split(r"[.,]", tail, maxsplit=1)[0]
-            int_digits = len(re.sub(r"\D", "", int_part))
-            if int_digits >= 4:
-                return m.group(0)
-            return f"{m.group(1)}{tail}"
-
-        text = re.sub(r"(?<!\d)(\d{1,2})\s+(\d{3,4}[.,]\d{2})(?!\d)", _merge_split_time, text)
-        return re.sub(r"(?<!\d)(\d{1,5})\s+(\d{2})(?!\d)", r"\1.\2", text)
-
     # Normalize and isolate TOP5 block
     upper_full = (top5_text or "").upper()
     m_top5 = RE_TOP5_SECTION.search(upper_full)
     block_upper = upper_full[m_top5.start() :] if m_top5 else upper_full
-    block_upper = _normalize_top5_time_layout(block_upper)
+    block_upper = normalize_split_time_layout(block_upper)
 
     block_raw = top5_text
     m2 = RE_TOP5_SECTION.search(block_raw)
     block_raw = block_raw[m2.start() :] if m2 else block_raw
-    block_raw = _normalize_top5_time_layout(block_raw)
+    block_raw = normalize_split_time_layout(block_raw)
 
     hinted_direct_time = extract_time_after_name_hint_from_text(block_upper, target_name)
     if hinted_direct_time is not None:
@@ -3712,9 +3763,9 @@ def normalize_map_code(raw_code_text: str | None, require_digit: bool = True) ->
     if not (4 <= len(raw_clean) <= 6):
         return None
 
-    normalized = raw_clean.replace("O", "0")
-    if require_digit and not any(ch.isdigit() for ch in normalized):
+    if require_digit and not any(ch.isdigit() for ch in raw_clean):
         return None
+    normalized = raw_clean.replace("O", "0")
     return normalized
 
 
@@ -3782,6 +3833,10 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
     colon_candidates: dict[str, float] = defaultdict(float)
     for source_text, weight in normalized_sources:
         for m in re.finditer(RE_CODE_AFTER_COLON, source_text):
+            before = source_text[max(0, m.start() - 24) : m.start()]
+            if RE_NON_CODE_FIELD_BEFORE_COLON.search(before):
+                continue
+
             token = m.group(1) or ""
             cand = normalize_map_code(token, require_digit=False)
             if not cand:
@@ -3802,7 +3857,6 @@ def extract_code(top_left_text: str, top_left_white_text: str, top_left_cyan_tex
             if digits >= 3:
                 score -= 0.20
 
-            before = source_text[max(0, m.start() - 20) : m.start()]
             after = source_text[m.end() : m.end() + 20]
             if "MAP" in before[-15:] or "MAP" in after[:15]:
                 score += 1.00
@@ -3914,16 +3968,22 @@ def extract_provided_code_from_texts(texts: list[str], provided_code: str | None
         if not text_up.strip():
             continue
 
+        labelled_text = re.sub(RE_MAP_CODE_NORMALIZATION, "MAP CODE", text_up)
+        for labelled_match in re.finditer(RE_CODE_KEYWORD_EXTRACT, labelled_text):
+            labelled_code = normalize_map_code(labelled_match.group(1), require_digit=False)
+            if codes_match_for_hint(labelled_code, provided_cmp):
+                return provided
+
         for m in re.finditer(r"[A-Z0-9]{4,10}", text_up):
             token = m.group(0)
             token_cmp = _normalize_code_for_compare(token)
-            if code_similarity(provided_cmp, token_cmp) >= HINT_MATCH_THRESHOLD:
+            if code_similarity(token_cmp, provided_cmp) >= HINT_MATCH_THRESHOLD:
                 return provided
 
             if len(token_cmp) > provided_len:
                 for i in range(0, len(token_cmp) - provided_len + 1):
                     part = token_cmp[i : i + provided_len]
-                    if code_similarity(provided_cmp, part) >= HINT_MATCH_THRESHOLD:
+                    if code_similarity(part, provided_cmp) >= HINT_MATCH_THRESHOLD:
                         return provided
 
     return None
@@ -3967,11 +4027,10 @@ def extract_code_from_code_variants(
 # =============================================================================
 def prefer_provided_code(extracted_code: str | None, provided_code: str | None) -> str | None:
     """
-    Prefer the client's provided code only if it matches OCR strongly.
+    Prefer the client's provided code only if OCR safely corroborates it.
 
     Purpose:
-      - Keep OCR as the source of truth, but allow hint override when it agrees.
-      - Optionally allow using hints as fallback when OCR fails (OCR_TRUST_HINTS).
+      - Keep OCR as the source of truth, while repairing known visual substitutions.
 
     Args:
       extracted_code:
@@ -3981,17 +4040,13 @@ def prefer_provided_code(extracted_code: str | None, provided_code: str | None) 
 
     Returns:
       - The chosen code:
-        - provided_code if it matches extracted_code at >= HINT_MATCH_THRESHOLD
-        - otherwise extracted_code
-        - (optional) provided_code if OCR_TRUST_HINTS is enabled and extracted_code is missing
+        - extracted_code when no hint was supplied
+        - provided_code when OCR safely corroborates it
+        - None when a supplied hint is absent from or contradicted by OCR
 
     Notes:
       - Normalizes provided_code using `normalize_map_code(require_digit=False)` for comparison.
-      - Similarity uses `code_similarity()` and the global threshold.
-    """
-    """
-    If provided_code matches extracted_code at >= 90%, return provided_code.
-    Otherwise return extracted_code (or provided_code only if OCR_TRUST_HINTS fallback is enabled).
+      - `codes_match_for_hint()` keeps relaxed matching limited to known OCR confusions.
     """
     provided_raw = (provided_code or "").strip()
     if not provided_raw:
@@ -4003,9 +4058,8 @@ def prefer_provided_code(extracted_code: str | None, provided_code: str | None) 
         return None
 
     # Require OCR extraction + strong match.
-    if extracted_code:
-        if code_similarity(provided, extracted_code) >= HINT_MATCH_THRESHOLD:
-            return provided
+    if extracted_code and codes_match_for_hint(extracted_code, provided):
+        return provided
 
     return None
 
@@ -4076,7 +4130,7 @@ def run_ocr_pipeline(
 
     Hint behavior:
     - If code/time are provided, we STILL extract from OCR.
-    - If the OCR output matches the provided hint at >= 90%, we return the PROVIDED hint in the response.
+    - If OCR safely corroborates the provided code hint, we return the PROVIDED hint in the response.
     - If name(s) are provided, we do NOT use bottom-left. We try:
         1) Banner: if banner name matches (>=90%), return banner time
         2) TOP5: if any entry name matches (>=90%), return that entry time
