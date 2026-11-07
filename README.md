@@ -40,7 +40,7 @@ curl -X POST http://localhost:8000/extract \
       "codeCandidates": ["WZJ79"],
       "codeEvidence": [],
       "timeCandidates": [],
-      "ocrPasses": 4
+      "ocrPasses": 8
     }
   }
 }
@@ -53,11 +53,12 @@ Unconfirmed fields are `null`. Reason codes include `name_not_detected`, `name_m
 ## Verification rules
 
 - A name/time pair must come from one localized completion banner or one spatially reconstructed leaderboard entry. Workshop layouts with a time directly below its player name are supported. Fragments from different OCR passes never form a name/time pair.
-- Without submitted aliases, an explicit named completion banner can identify the player. Leaderboard extraction requires a matching HUD identity; an arbitrary leaderboard row cannot identify the submitter.
+- Without submitted aliases, a named completion banner or matching HUD identity can identify the player. A unique named row below an observed TOP 5 header can also support the submitted time. This reports the screenshot's row owner; it does not prove account ownership. Multiple players at the same time remain ambiguous.
 - Live top-left timers, checkpoint splits, and a name appearing elsewhere do not prove completion. A matching completion banner takes priority over older leaderboard entries. Conflicting readings for the same identity/source remain unconfirmed.
 - Time comparison uses exact integer centiseconds and an absolute tolerance, default `0`. Range validation defaults to 10–15360 seconds. A mismatching submitted time returns `null`; hints never supply missing OCR evidence.
-- Workshop codes are literal 4–6 alphanumeric characters, including all-letter codes. `O/0`, `I/1`, partial codes, and different final characters are distinct. An enlarged or localized pass must independently read a complete code to resolve ambiguity. Localized code-label geometry can establish the field's location for another pass that reads the literal code there.
-- Name comparison normalizes Unicode compatibility forms, case, spacing, and Latin diacritics separately from display. A single familiar Latin digit/letter confusion in a name of at least five characters may match. Short CJK names and arbitrary character edits are not fuzzy-matched.
+- Workshop codes are literal 4–6 alphanumeric characters, including all-letter codes. Verification resolves targeted field readings before consulting the submitted code. A truncated prefix cannot override an independently read complete field; conflicting token readings remain unconfirmed. Localized label geometry can establish the field's location for another pass.
+- `O/0`, `I/1`, and different final characters are distinct. The tested HUD font produces confident `O` readings for real zeros across multiple models. An isolated code-token reading containing `O` therefore keeps the code unconfirmed (`code_glyph_ambiguous`), including genuine letter-O codes; it is never converted to zero. Without token readings, the same guard applies to focused field readings. Codes whose isolated readings consistently show `0` can still be confirmed despite a whole-line misreading. This conservative limitation needs better glyph evidence before it can be relaxed.
+- Name comparison normalizes Unicode compatibility forms, case, spacing, and Latin diacritics separately from display. Japanese voicing marks remain part of the identity. A single familiar Latin digit/letter confusion in a name of at least five characters may match. Short CJK names and arbitrary character edits are not fuzzy-matched.
 
 ## Running
 
@@ -77,7 +78,9 @@ docker build -t genjishimada-ocr .
 docker run --rm -p 8000:8000 genjishimada-ocr
 ```
 
-The process warms English, Korean, Japanese, and Chinese models at startup. Existing Docker model directories under `~/.paddleocr/whl` are supported; absent directories trigger Paddle's normal model download. `PADDLE_PDX_CACHE_HOME` can relocate downloaded models. Models are reused, and OCR calls are serialized through one FIFO worker per process. A timed-out request retains the inference slot until native OCR finishes. More workers duplicate models and inference capacity; start with one.
+The process warms English, Korean, Japanese, and Chinese mobile models at startup. A high-capacity CJK recognizer is loaded lazily for small, ambiguous Japanese/Chinese name cells. A bounded Tesseract Korean fallback reads the same actual name cell with an independent model when needed; it never receives a supplied alias. Docker includes Tesseract and a checksum-pinned official Korean model. Local Python installations need `tesseract` on PATH and `kor.traineddata` under `~/.paddleocr/whl/rec/tesseract` to enable that fallback; otherwise it abstains.
+
+Existing Docker model directories under `~/.paddleocr/whl` are supported; absent Paddle directories trigger its normal model download. `PADDLE_PDX_CACHE_HOME` can relocate downloaded Paddle models. OCR calls, including targeted fallbacks, stay serialized through one FIFO worker per process. A timed-out request retains the inference slot until native OCR finishes. More workers duplicate model memory and inference capacity; start with one.
 
 ## Configuration
 
@@ -103,5 +106,6 @@ Validation results and remaining recognition limitations are recorded in the pul
 
 - `main.py`: API, queue, preprocessing, inference adapters, orchestration, and compatible text helpers.
 - `evidence.py`: model-independent Unicode/code/time parsing, structured detections, spatial grouping, and relationship validation.
+- `fallback_ocr.py`: optional, bounded Korean name-cell recognition without name hints.
 
-MIT. Built with [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), FastAPI, OpenCV, NumPy, and Pillow.
+MIT. Built with [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), [Tesseract](https://github.com/tesseract-ocr/tesseract), FastAPI, OpenCV, NumPy, and Pillow.

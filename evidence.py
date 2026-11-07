@@ -31,6 +31,18 @@ CODE_LABEL = re.compile(
     r"地图\s*码|地圖\s*碼|マップ\s*コード)\s*[:\uff1a=\-]?\s*",
     re.IGNORECASE,
 )
+NOISY_CODE_FIELD = re.compile(
+    r"^(?:O\s*H(?:\s*[CF]){0,2}|H\s*(?:A\s*)?C)\s*[:\uff1a]\s*([A-Z0-9]{4,6})\s*$",
+    re.IGNORECASE,
+)
+CREATOR_FIELD = re.compile(
+    r"^(?:MADE\s+BY|CREATOR|AUTHOR|제작자|作者|製作者|制作者|作成者)\s*[:\uff1a]\s*\S.*$",
+    re.IGNORECASE,
+)
+DISCORD_FIELD = re.compile(
+    r"^DISCORD\s*[:\uff1a]\s*(?:https?://)?(?:dsc\.gg|discord\.gg|discord(?:app)?\.com/invite)/[A-Z0-9_-]+\s*$",
+    re.IGNORECASE,
+)
 NOISE = {
     "mission",
     "complete",
@@ -128,12 +140,44 @@ class Pair:
     rows: tuple[Row, ...]
 
 
+@dataclass(frozen=True)
+class MetadataCodeRegion:
+    """An unverified code-field location bounded by independent semantic anchors."""
+
+    row: Row
+    creator_bounds: tuple[float, float, float, float]
+    timer_bounds: tuple[float, float, float, float]
+
+
 def normalize_name(value: str) -> str:
-    """Normalize comparison only, retaining letters from every script and digits."""
+    """Fold Latin accents for comparison while preserving other scripts' identity marks."""
     value = unicodedata.normalize("NFKC", value).casefold()
-    return "".join(
-        c for c in unicodedata.normalize("NFD", value) if unicodedata.category(c)[0] in {"L", "N"} or c == "_"
-    )
+    normalized = []
+    latin_base = False
+    for char in unicodedata.normalize("NFD", value):
+        category = unicodedata.category(char)
+        if category[0] in {"L", "N"}:
+            normalized.append(char)
+            latin_base = category[0] == "L" and "LATIN" in unicodedata.name(char, "")
+        elif category[0] == "M":
+            # Dakuten/handakuten and East Asian tone marks are identity-bearing,
+            # including unusual mixed-script names where they follow Latin.
+            specific_mark = any(
+                script in unicodedata.name(char, "") for script in ("KATAKANA", "HIRAGANA", "IDEOGRAPHIC", "HANGUL")
+            )
+            diacritic = (
+                ("\u0300" <= char <= "\u036f" and char != "\u034f")
+                or "\u1ab0" <= char <= "\u1aff"
+                or "\u1dc0" <= char <= "\u1dff"
+                or "\ufe20" <= char <= "\ufe2f"
+            )
+            if not latin_base or specific_mark or not diacritic:
+                normalized.append(char)
+        else:
+            if not char.isspace() and category != "Cf":
+                normalized.append(char)
+            latin_base = False
+    return unicodedata.normalize("NFC", "".join(normalized))
 
 
 def name_score(left: str | None, right: str | None) -> float:
@@ -228,6 +272,17 @@ def text_pairs(text: str, source: str = "topRight.top5", minimum: float = 10.0) 
         start = 0
         for match, cs in time_values(line, minimum):
             prefix = line[start : match.start()].strip(" :\uff1a|-\t")
+            # A separate digit before a decimal can belong to the time rather
+            # than the identity: ``Alice 1 107.23`` must not verify Alice1's
+            # 107.23 result. Text alone cannot resolve that boundary.
+            leading = re.search(r"(?:^|\s)(\d{1,2})$", prefix)
+            if leading:
+                raw = unicodedata.normalize("NFKC", match[1]).upper()
+                raw = re.sub(r"\s", "", raw).translate(_DIGITS)
+                combined = to_centiseconds(re.sub(r"[,:\uff0c\uff0e]", ".", leading[1] + raw))
+                if combined is not None and minimum * 100 <= combined <= 1536000:
+                    start = match.end()
+                    continue
             name = clean_name(prefix)
             if name:
                 pairs.append((name, cs))
@@ -256,8 +311,11 @@ def code_values(text: str) -> list[str]:
                 continue
             first, second = token.groups()
             code = normalize_code(first)
-            if second and (not code or len(second) == 1) and normalize_code(first + second):
-                code = normalize_code(first + second)
+            # Text alone cannot establish whether adjacent alphanumeric chunks
+            # are one code or different HUD fields, even when the first chunk
+            # is too short to be a valid code. Spatial assembly happens below.
+            if second:
+                continue
             if code and code not in result:
                 result.append(code)
     return result
@@ -426,6 +484,7 @@ def labelled_codes(detections: list[Detection]) -> list[tuple[str, Row]]:
         if row.confidence < 0.65:
             continue
         values = code_values(row.text)
+        values.extend(value for value in _spatial_code_values(row) if value not in values)
         if not values and row.bounds:
             # Recognition can destroy a localized label while preserving its code.
             # Only a complete colon-delimited field at a separately observed code
@@ -441,7 +500,162 @@ def labelled_codes(detections: list[Detection]) -> list[tuple[str, Row]]:
                         values = [field[1].upper()]
                         break
         result.extend((value, row) for value in values)
+    result.extend(candidate for candidate in _metadata_codes(rows) if candidate not in result)
     return result
+
+
+def _metadata_neighbors(above: Row, below: Row) -> bool:
+    """Require aligned, closely spaced metadata rows in screenshot coordinates."""
+    a, b = above.bounds, below.bounds
+    if not a or not b:
+        return False
+    ah, bh = a[3] - a[1], b[3] - b[1]
+    if ah <= 0 or bh <= 0 or not 0.5 <= bh / ah <= 2.0:
+        return False
+    gap = b[1] - a[3]
+    return -min(ah, bh) * 0.15 <= gap <= max(ah, bh) * 2 and abs(a[0] - b[0]) <= max(ah, bh) * 1.5
+
+
+def _timer_field(row: Row) -> bool:
+    """Recognize a complete labelled timer for metadata position, never completion evidence."""
+    label = re.match(TIME_LABEL, row.text, re.IGNORECASE)
+    if not label:
+        return False
+    tail = row.text[label.end() :].strip(" :\uff1a")
+    values = time_values(tail)
+    return len(values) == 1 and values[0][0].span() == (0, len(tail)) and values[0][0][2] is not None
+
+
+def _metadata_blocks(rows: list[Row]) -> list[tuple[Row, Row]]:
+    """Locate creator/timer anchors whose nearby Discord URL is recognized in the same pass."""
+    passes: dict[tuple[str, str, str, str], list[Row]] = defaultdict(list)
+    for row in rows:
+        first = row.detections[0]
+        if first.roi == "topLeft" and row.bounds and row.confidence >= 0.85:
+            passes[first.pass_id, first.roi, first.language, first.variant].append(row)
+    blocks = []
+    for observations in passes.values():
+        creators = [row for row in observations if CREATOR_FIELD.fullmatch(row.text)]
+        timers = [row for row in observations if _timer_field(row)]
+        discord_rows = [row for row in observations if DISCORD_FIELD.fullmatch(row.text)]
+        # The observed Korean layout places Discord immediately above creator,
+        # followed by the code and timer. All three semantic anchors must be
+        # established together in one pass; only the literal code may come from
+        # another model at that same screenshot location.
+        blocks.extend(
+            (creator, timer)
+            for creator in creators
+            for timer in timers
+            if any(_metadata_neighbors(discord, creator) for discord in discord_rows)
+        )
+    return blocks
+
+
+def metadata_code_regions(detections: list[Detection]) -> list[MetadataCodeRegion]:
+    """Localize noisy code fields for an independent image pass, without verifying their text."""
+    rows = group_rows(detections)
+    blocks = _metadata_blocks(rows)
+    result = []
+    for row in rows:
+        field = row.bounds
+        if row.detections[0].roi != "topLeft" or not field or not NOISY_CODE_FIELD.fullmatch(row.text):
+            continue
+        for creator, timer in blocks:
+            a, b = creator.bounds, timer.bounds
+            assert a is not None and b is not None
+            height = max(a[3] - a[1], b[3] - b[1])
+            center = (field[1] + field[3]) / 2
+            # Occlusion can enlarge a low-confidence detection into a nearby
+            # timer. Only its center localizes the field; callers must crop
+            # between the actual creator bottom and timer top before re-reading.
+            if (
+                0 < b[1] - a[3] <= height * 3
+                and a[3] < center < b[1]
+                and height * 0.5 <= field[3] - field[1] <= height * 2
+                and abs(field[0] - a[0]) <= height * 1.5
+                and abs(field[0] - b[0]) <= height * 1.5
+            ):
+                result.append(MetadataCodeRegion(row, a, b))
+                break
+    return result
+
+
+def _metadata_codes(rows: list[Row]) -> list[tuple[str, Row]]:
+    """Verify a noisy localized code field only when its own literal reading is confident."""
+    blocks = _metadata_blocks(rows)
+    return [
+        (code, row)
+        for row in rows
+        if row.detections[0].roi == "topLeft" and row.bounds and row.confidence >= 0.80
+        if (field := NOISY_CODE_FIELD.fullmatch(row.text)) and (code := normalize_code(field[1]))
+        if any(_metadata_neighbors(creator, row) and _metadata_neighbors(row, timer) for creator, timer in blocks)
+    ]
+
+
+def _tight_neighbors(left: Detection, right: Detection) -> bool:
+    """Require adjoining glyphs of the same size, rather than a shared HUD baseline."""
+    a, b = left.bounds, right.bounds
+    if not a or not b:
+        return False
+    ah, bh = a[3] - a[1], b[3] - b[1]
+    if ah <= 0 or bh <= 0 or not 0.65 <= bh / ah <= 1.35:
+        return False
+    overlap = min(a[3], b[3]) - max(a[1], b[1])
+    characters = len(re.sub(r"\s", "", left.text))
+    average_width = (a[2] - a[0]) / max(1, characters)
+    gap = b[0] - a[2]
+    return overlap >= min(ah, bh) * 0.65 and 0 <= gap <= min(ah * 0.65, average_width * 0.85)
+
+
+def _spatial_code_values(row: Row) -> list[str]:
+    """Join code suffix detections only when the image places their glyphs together."""
+    found = []
+    fragments = row.detections
+    for index, left in enumerate(fragments[:-1]):
+        label = CODE_LABEL.search(left.text)
+        fragment = left.text[label.end() :].strip() if label else left.text.strip()
+        if not re.fullmatch(r"[A-Z0-9]{1,5}", fragment, re.IGNORECASE):
+            continue
+        base = fragment.upper()
+        if not label:
+            if index == 0:
+                continue
+            previous = fragments[index - 1].text
+            previous_label = CODE_LABEL.search(previous)
+            if not previous_label or previous[previous_label.end() :].strip():
+                continue
+        code = base
+        current = left
+        for right in fragments[index + 1 :]:
+            suffix = right.text.strip()
+            if not re.fullmatch(r"[A-Z0-9]{1,5}", suffix, re.IGNORECASE) or not _tight_neighbors(current, right):
+                break
+            code += suffix.upper()
+            current = right
+            if len(code) > 6:
+                code = ""
+                break
+        if code != base and normalize_code(code):
+            found.append(code)
+    return found
+
+
+def _pair_text(row: Row) -> str:
+    """Resolve isolated numeric fragments only when their spatial field is unambiguous."""
+    fragments = row.detections
+    parts = []
+    for index, fragment in enumerate(fragments):
+        separator = " "
+        if index and re.fullmatch(r"\d{1,2}", fragments[index - 1].text.strip()):
+            left = fragments[index - 1]
+            number_starts_here = TIME.fullmatch(normalize_time_text(fragment.text).strip()) is not None
+            # If that isolated digit is also close to a preceding name, the
+            # identity/time boundary remains ambiguous and must stay explicit.
+            close_to_name = index >= 2 and _tight_neighbors(fragments[index - 2], left)
+            if number_starts_here and _tight_neighbors(left, fragment) and not close_to_name:
+                separator = ""
+        parts.append((separator if parts else "") + fragment.text)
+    return "".join(parts)
 
 
 def paired_evidence(detections: list[Detection], source: str, minimum: float = 10.0) -> list[Pair]:
@@ -449,7 +663,7 @@ def paired_evidence(detections: list[Detection], source: str, minimum: float = 1
     rows = group_rows(detections)
     pairs = []
     for row in rows:
-        for name, cs in text_pairs(row.text, source, minimum):
+        for name, cs in text_pairs(_pair_text(row), source, minimum):
             pairs.append(Pair(name, cs, source, row.confidence, (row,)))
     if source != "topRight.top5":
         return pairs
@@ -467,8 +681,9 @@ def paired_evidence(detections: list[Detection], source: str, minimum: float = 1
         )
         if not name or not a or not b or not same_pass:
             continue
-        values = time_values(following.text, minimum)
-        if len(values) != 1 or following.text[: values[0][0].start()].strip():
+        following_text = _pair_text(following)
+        values = time_values(following_text, minimum)
+        if len(values) != 1 or following_text[: values[0][0].start()].strip(" \t.,|"):
             continue
         height = max(a[3] - a[1], b[3] - b[1])
         if 0 <= b[1] - a[3] <= height * 0.8 and abs(a[0] - b[0]) <= height:

@@ -12,6 +12,7 @@ import unicodedata
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from itertools import pairwise
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, AsyncIterator, Literal
@@ -24,9 +25,10 @@ from PIL import Image, ImageFile
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 import evidence
+import fallback_ocr
 
 if TYPE_CHECKING:
-    from paddleocr import PaddleOCR
+    from paddleocr import PaddleOCR, TextRecognition
 
 # =============================================================================
 # Runtime / CPU safety
@@ -401,6 +403,7 @@ _HANGUL_TENSE_MAP = {
 # =============================================================================
 OCR_ENGINES: dict[LanguageCode, PaddleOCR] = {}
 OCR_ENGINES_NO_MKLDNN: dict[LanguageCode, PaddleOCR] = {}
+OCR_NAME_RECOGNIZERS: dict[str, TextRecognition] = {}
 SUPPORTED_LANGUAGES: tuple[LanguageCode, ...] = ("en", "ch", "korean", "japan")
 
 # Backwards-compat mapping used by older code paths
@@ -572,7 +575,9 @@ def warm_ocr_engines(languages: tuple[LanguageCode, ...] = SUPPORTED_LANGUAGES) 
     for lang in languages:
         if lang in OCR_ENGINES:
             continue
-        logger.info(f"📥 Warming PaddleOCR model: {lang} (MKLDNN {'ON' if OCR_MKLDNN else 'OFF'}, threads={OCR_CPU_THREADS})")
+        logger.info(
+            f"📥 Warming PaddleOCR model: {lang} (MKLDNN {'ON' if OCR_MKLDNN else 'OFF'}, threads={OCR_CPU_THREADS})"
+        )
         OCR_ENGINES[lang] = _build_ocr_engine(lang)
         logger.info(f"✅ Model ready: {lang}")
 
@@ -623,7 +628,9 @@ def log_model_dirs() -> None:
     # Emit per-language model paths for troubleshooting.
     for lang in ("en", "korean", "japan", "ch"):
         det_dir, rec_dir, ocr_version, det_name, rec_name = _model_dirs_for_language_code(lang)  # type: ignore[arg-type]
-        logger.info(f"[models] {lang}: ocr={ocr_version} det={det_dir} rec={rec_dir} det_name={det_name} rec_name={rec_name}")
+        logger.info(
+            f"[models] {lang}: ocr={ocr_version} det={det_dir} rec={rec_dir} det_name={det_name} rec_name={rec_name}"
+        )
 
 
 # =============================================================================
@@ -1266,7 +1273,9 @@ def ocr_detections(image: np.ndarray, language_code: LanguageCode) -> list[evide
             result = engine.ocr(bgr) or []
     except Exception as e:
         if OCR_MKLDNN and _looks_like_onednn_pir_bug(e):
-            logger.warning(f"OCR({language_code}) failed with oneDNN/PIR error under MKLDNN; retrying with MKLDNN OFF: {e}")
+            logger.warning(
+                f"OCR({language_code}) failed with oneDNN/PIR error under MKLDNN; retrying with MKLDNN OFF: {e}"
+            )
             fb = OCR_ENGINES_NO_MKLDNN.get(language_code)
             if fb is None:
                 fb = _build_ocr_engine(language_code, enable_mkldnn=False, cpu_threads=OCR_CPU_THREADS)
@@ -1959,7 +1968,7 @@ def _clean_ascii_token(raw: str) -> str:
             s = prefix
 
     digit_count = sum(ch.isdigit() for ch in s)
-    polluted = (len(s) >= 12 and digit_count >= 3)
+    polluted = len(s) >= 12 and digit_count >= 3
 
     if polluted:
         s_for_prefix = s.replace("1", "I")
@@ -2158,7 +2167,7 @@ def extract_name_from_banner(text_banner: str) -> str | None:
     for line in text_banner.splitlines():
         match = evidence.COMPLETION.search(line)
         if match:
-            name = evidence.completion_name(line[:match.start()])
+            name = evidence.completion_name(line[: match.start()])
             if name:
                 return name
     return None
@@ -2577,6 +2586,25 @@ def read_roi_evidence(  # noqa: PLR0913 - explicit OCR provenance and coordinate
     ]
 
 
+def recognize_precise_name(image: np.ndarray) -> tuple[str, float] | None:
+    """Read one bounded CJK name with a lazy, cached high-capacity recognizer."""
+    model = "PP-OCRv5_server_rec"
+    engine = OCR_NAME_RECOGNIZERS.get(model)
+    if engine is None:
+        from paddleocr import TextRecognition  # noqa: PLC0415 - lazy targeted fallback only
+
+        model_dir = _pick_existing_dir(PADDLE_WHL_DIR / "rec" / "ppocrv5" / "PP-OCRv5_server_rec_infer")
+        engine = TextRecognition(
+            model_name=model, model_dir=model_dir, device="cpu", enable_mkldnn=False, cpu_threads=OCR_CPU_THREADS
+        )
+        OCR_NAME_RECOGNIZERS[model] = engine
+    detections = evidence.parse_ocr_result(engine.predict(image))
+    if len(detections) != 1 or detections[0].confidence < 0.85:
+        return None
+    name = evidence.clean_name(detections[0].text)
+    return (name, detections[0].confidence) if name else None
+
+
 def run_ocr_pipeline(
     img: np.ndarray,
     *,
@@ -2601,6 +2629,7 @@ def run_ocr_pipeline(
     crops = {label: crop_by_frac_roi(img, frac) for label, frac in regions.items()}
     offsets = {label: (float(int(frac[0] * width)), float(int(frac[1] * height))) for label, frac in regions.items()}
     observations: list[evidence.Detection] = []
+    precise_entries: list[tuple[evidence.Pair, evidence.Pair]] = []
     passes = 0
 
     def scan(
@@ -2627,14 +2656,25 @@ def run_ocr_pipeline(
         )
         passes += 1
 
+    def same_entry(left: evidence.Pair, right: evidence.Pair) -> bool:
+        a, b = left.rows[0].bounds, right.rows[0].bounds
+        if not a or not b or left.source != right.source or left.centiseconds != right.centiseconds:
+            return False
+        area = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+        overlap = max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+        return area > 0 and overlap / area >= 0.7
+
     def pairs_now() -> list[evidence.Pair]:
-        return [
+        native = [
             p
             for label, source in (("banner", "banner"), ("topRight", "topRight.top5"))
             for p in evidence.paired_evidence(
                 [d for d in observations if d.roi == label], source, MIN_VALID_TIME_SECONDS
             )
             if p.confidence >= 0.65
+        ]
+        return [p for p in native if not any(same_entry(p, parent) for parent, _ in precise_entries)] + [
+            replacement for _, replacement in precise_entries
         ]
 
     def bottom_left_names() -> list[tuple[str, evidence.Row]]:
@@ -2645,56 +2685,228 @@ def run_ocr_pipeline(
         if aliases:
             return [p for p in pairs_now() if any(names_match_strict(p.name, a) for a in aliases)]
         bl = bottom_left_names()
-        # A leaderboard by itself does not identify the submitting player.
-        return [p for p in pairs_now() if p.source == "banner" or any(names_match_strict(p.name, n) for n, _ in bl)]
+        # With no submitted identity, a unique named leaderboard entry at the
+        # submitted time is direct result evidence. Its own row supplies BOTH
+        # fields; unrelated names and live timers never contribute to this.
+        all_pairs = pairs_now()
+        headers = [
+            d.bounds
+            for d in observations
+            if d.roi == "topRight"
+            and d.confidence >= 0.65
+            and d.bounds
+            and re.search(r"\bTOP\s*5\b|\ud0d1\s*5|\uc21c\uc704\s*5|\u524d\s*5", d.text, re.IGNORECASE)
+        ]
+        matching = [
+            p
+            for p in all_pairs
+            if time_hint is not None
+            and time_similarity(p.centiseconds / 100, time_hint)
+            and p.rows[0].bounds
+            and any(p.rows[0].bounds[1] >= box[3] for box in headers)
+        ]
+        identities_at_time = {evidence.normalize_name(p.name) for p in matching}
+        unique = matching if len(identities_at_time) == 1 else []
+        banner_names = [
+            name
+            for row in evidence.group_rows([d for d in observations if d.roi == "banner"])
+            if row.confidence >= 0.65 and (name := extract_name_from_banner(row.text))
+        ]
+        identities = [name for name, _ in bl] + banner_names
+        return [
+            p
+            for p in all_pairs
+            if p.source == "banner" or p in unique or any(names_match_strict(p.name, name) for name in identities)
+        ]
 
     def code_candidates() -> list[tuple[str, evidence.Row]]:
-        return evidence.labelled_codes([d for d in observations if d.roi == "topLeft"])
+        detections = [d for d in observations if d.roi == "topLeft"]
+        values = evidence.labelled_codes([d for d in detections if not d.variant.startswith("codeToken")])
+        # These observations come from an explicitly located code field, not
+        # arbitrary HUD tokens. Require a complete literal reading of the crop.
+        for row in evidence.group_rows([d for d in detections if d.variant.startswith("codeToken")]):
+            if row.confidence < 0.85:
+                continue
+            pieces = sorted(row.detections, key=lambda d: d.bounds[0] if d.bounds else 0)
+            adjacent = True
+            for left_piece, right_piece in pairwise(pieces):
+                a, b = left_piece.bounds, right_piece.bounds
+                if not a or not b or b[0] - a[2] > min(a[3] - a[1], b[3] - b[1]) * 0.65:
+                    adjacent = False
+            text = row.text.strip(" :\uff1a")
+            bilingual = re.fullmatch(r"([A-Z0-9]{4,6})\s*[-:]\s*(?:代码|代碼|코드|CODE)", text, re.IGNORECASE)
+            value = evidence.normalize_code(bilingual.group(1) if bilingual else re.sub(r"\s+", "", text))
+            if adjacent and value:
+                values.append((value, row))
+        return values
+
+    def verified_code() -> str | None:
+        # Resolve the observed field before consulting the submitted code. A
+        # matching hint must not stop the pass which reveals a clipped suffix.
+        focused = [(value, row) for value, row in code_candidates() if row.detections[0].variant != "raw"]
+        # This HUD font renders O and 0 ambiguously: several recognizers can
+        # confidently agree on O for a real zero. Agreement alone therefore
+        # cannot establish that glyph's identity. Abstain, without rewriting it
+        # or consulting the hint. Unambiguous zero readings remain literal.
+        tokens = [(value, row) for value, row in focused if row.detections[0].variant.startswith("codeToken")]
+        if not tokens and not label_rows:
+            return None
+        pool = tokens or focused
+        if any("O" in value and row.confidence >= 0.85 for value, row in pool):
+            return None
+        values = {value for value, _ in pool}
+        # An independently read longer field supersedes its truncated prefix.
+        values = {
+            value
+            for value in values
+            if not any(other.startswith(value) and len(other) > len(value) for other in values)
+        }
+        if len(values) != 1:
+            return None
+        value = next(iter(values))
+        supporting = [row for observed, row in pool if observed == value]
+        languages = {row.detections[0].language for row in supporting}
+        if len(languages) >= 2:
+            return value
+        if tokens and max(row.confidence for row in supporting) >= 0.95:
+            # A clean token may exclude the last label glyph while another
+            # model still includes it. Require corroboration of the SAME full
+            # literal value from that other model's labelled metadata field.
+            for observed, row in code_candidates():
+                if observed != value or row.confidence < 0.80 or row.detections[0].language in languages:
+                    continue
+                b = row.bounds
+                for token_row in supporting:
+                    a = token_row.bounds
+                    if not a or not b or token_row.confidence < 0.95:
+                        continue
+                    glyph_height = min(a[3] - a[1], b[3] - b[1])
+                    overlap = min(a[3], b[3]) - max(a[1], b[1])
+                    if glyph_height > 0 and overlap >= glyph_height * 0.65 and b[0] <= (a[0] + a[2]) / 2 <= b[2]:
+                        return value
+        # A high-confidence complete targeted line can recover a missing final
+        # glyph even when the other model cannot read that small character.
+        shorter = any(value.startswith(other) and len(other) < len(value) for other, _ in focused)
+        if not tokens and shorter and max(row.confidence for row in supporting) >= 0.95:
+            return value
+        return None
+
+    def code_is_confirmed() -> bool:
+        value = verified_code()
+        # Four characters may be a clipped five-character code. Always inspect
+        # the enlarged/token field before treating this as a complete reading.
+        return value is not None and (len(value) > 4 or code_field_checked)
+
+    def pair_is_confirmed() -> bool:
+        pairs = relevant_pairs()
+        banner = [pair for pair in pairs if pair.source == "banner"]
+        pool = banner or pairs
+        for alias in aliases or list(dict.fromkeys(pair.name for pair in pool)):
+            values = {pair.centiseconds for pair in pool if names_match_strict(pair.name, alias)}
+            if len(values) == 1 and (time_hint is None or time_similarity(next(iter(values)) / 100, time_hint)):
+                return True
+        return False
 
     # Latin code recognition is independent of the player's language.
+    code_field_checked = False
     scan("topLeft", "en")
     candidates = code_candidates()
-    if not candidates or (code and not any(value == code_hint for value, _ in candidates)):
-        # Locate observed label/code baselines and retain horizontal context. Crop to
-        # one actual line where possible so tiny final characters are not lost in HUD text.
-        label_rows = [r for r in evidence.group_rows(observations) if evidence.CODE_LABEL.search(r.text) and r.bounds]
-        if label_rows:
-            box = label_rows[0].bounds
-            assert box is not None
-            x1 = max(0, int(box[0]) - 12)
-            y1 = max(0, int(box[1]) - 8)
-            x2 = min(width, int(box[2] + max(48, (box[3] - box[1]) * 2)))
-            y2 = min(height, int(box[3]) + 8)
-            focused = img[y1:y2, x1:x2]
-            focus_offset = (float(x1), float(y1))
-        else:
-            focused = crops["topLeft"][: max(1, int(crops["topLeft"].shape[0] * 0.40))]
-            focus_offset = offsets["topLeft"]
-        variants = [
-            ("codeUpscale", upscale(focused, 3.0)),
-            ("cyan", upscale(mask_hud_cyan_regions(focused), 3.0)),
-            ("white", upscale(mask_white_regions(focused), 3.0)),
+    # Locate observed label/code baselines and retain horizontal context. Crop to
+    # one actual line where possible so tiny final characters are not lost in HUD text.
+    label_rows = [r for r in evidence.group_rows(observations) if evidence.CODE_LABEL.search(r.text) and r.bounds]
+    if label_rows:
+        box = label_rows[0].bounds
+        assert box is not None
+        padding = max(5, int((box[3] - box[1]) * 0.25))
+        x1 = max(0, int(box[0]) - padding)
+        y1 = max(0, int(box[1]) - padding)
+        x2 = min(width, int(box[2] + max(48, (box[3] - box[1]) * 2)))
+        y2 = min(height, int(box[3]) + padding)
+        focused = img[y1:y2, x1:x2]
+        focus_offset = (float(x1), float(y1))
+    else:
+        focused = crops["topLeft"][: max(1, int(crops["topLeft"].shape[0] * 0.40))]
+        focus_offset = offsets["topLeft"]
+    enlarged_code = upscale(focused, 3.0)
+    # Preserve native glyphs first: detector max-side resizing can undo
+    # enlargement and erase a thin trailing character in high-res HUDs.
+    scan("topLeft", "en", "codeNative", focused, (focus_offset, focused.shape))
+    if not code_is_confirmed():
+        scan("topLeft", "ch", "codeNative", focused, (focus_offset, focused.shape))
+    if not code_is_confirmed():
+        scan("topLeft", "en", "codeUpscale", enlarged_code, (focus_offset, focused.shape))
+    if not code_is_confirmed():
+        scan("topLeft", "ch", "codeLocalized", enlarged_code, (focus_offset, focused.shape))
+    if not label_rows:
+        scan("topLeft", "korean", "codeLocalized", focused, (focus_offset, focused.shape))
+        scan("topLeft", "ch")
+        label_rows = [
+            row
+            for row in evidence.group_rows(observations)
+            if row.detections[0].roi == "topLeft" and evidence.CODE_LABEL.search(row.text) and row.bounds
         ]
-        for label, variant in variants:
-            scan("topLeft", "en", label, variant, (focus_offset, focused.shape))
-            candidates = code_candidates()
-            if candidates and (not code or any(value == code_hint for value, _ in candidates)):
+    if label_rows:
+        # Isolate the actual token after the observed label. Removing the
+        # English label reduces word-context O/0 and I/1 recognition bias.
+        row = label_rows[0]
+        label = evidence.CODE_LABEL.search(row.text)
+        if label and row.bounds:
+            box = row.bounds
+            prefix = row.text[: label.end()]
+            advance = sum(0.45 if ch.isspace() or ch in ":-" else 1.0 for ch in row.text)
+            prefix_advance = sum(0.45 if ch.isspace() or ch in ":-" else 1.0 for ch in prefix)
+            left = max(0, int(box[0] + (box[2] - box[0]) * prefix_advance / max(1, advance) - (box[3] - box[1]) * 0.2))
+            top = max(0, int(box[1]) - 5)
+            right = min(width, int(box[2] + (box[3] - box[1])))
+            bottom = min(height, int(box[3]) + 5)
+            token = img[top:bottom, left:right]
+            geometry = ((float(left), float(top)), token.shape)
+            for language in ("en", "ch"):
+                scan("topLeft", language, "codeToken", upscale(token, 4.0), geometry)
+    if not code_is_confirmed():
+        scan("topLeft", "en", "cyan", upscale(mask_hud_cyan_regions(focused), 3.0), (focus_offset, focused.shape))
+    if not code_is_confirmed():
+        for region in evidence.metadata_code_regions([d for d in observations if d.roi == "topLeft"]):
+            row = region.row
+            field = evidence.NOISY_CODE_FIELD.fullmatch(row.text)
+            box = row.bounds
+            if not field or not box:
+                continue
+            advance = sum(0.45 if ch.isspace() or ch in ":-" else 1.0 for ch in row.text)
+            prefix = row.text[: field.start(1)]
+            prefix_advance = sum(0.45 if ch.isspace() or ch in ":-" else 1.0 for ch in prefix)
+            left = max(0, int(box[0] + (box[2] - box[0]) * prefix_advance / max(1, advance) - (box[3] - box[1]) * 0.4))
+            top = max(0, int(region.creator_bounds[3]) + 1)
+            right = min(width, int(box[2] + (box[3] - box[1]) * 0.5))
+            bottom = min(height, int(region.timer_bounds[1]) - 1)
+            if bottom <= top or right <= left:
+                continue
+            token = img[top:bottom, left:right]
+            geometry = ((float(left), float(top)), token.shape)
+            for language in ("en", "ch"):
+                scan("topLeft", language, "codeTokenMetadata", token, geometry)
+            if code_is_confirmed():
                 break
-        if not candidates:
-            # Chinese recognition also reads Latin codes and localized labels.
-            scan("topLeft", "ch")
-            candidates = code_candidates()
-        if not candidates:
-            scan("topLeft", "korean", "codeLocalized", focused, (focus_offset, focused.shape))
-            candidates = code_candidates()
+    code_field_checked = True
+    candidates = code_candidates()
 
     preferred: list[LanguageCode] = []
     for alias in aliases:
         for language in _preferred_langs_for_name_hint(alias):
             if language not in preferred:
                 preferred.append(language)
+    if aliases and all(count_cjk(alias) > 0 for alias in aliases):
+        # An English-only pass cannot recognize an all-CJK allowed identity,
+        # so it cannot produce a valid independent name/time pair here.
+        preferred = [language for language in preferred if language != "en"]
+    if "japan" in preferred and "ch" in preferred:
+        # Both languages use the same explicit mobile recognizer and detector.
+        preferred.remove("ch" if preferred.index("japan") < preferred.index("ch") else "japan")
     if not preferred:
-        preferred = ["en", "korean", "japan", "ch"]
+        # The shared model reads Japanese, Han and Latin. Starting with English
+        # can hallucinate a consistent Latin spelling for a Japanese HUD name
+        # and then suppress the model that actually supports those characters.
+        preferred = ["ch", "en", "korean"]
 
     # A live TL timer cannot trigger early success. Check both completion and
     # leaderboard evidence before selecting a value, even in FAST_OCR mode.
@@ -2702,19 +2914,212 @@ def run_ocr_pipeline(
     for label in ("banner", "topRight", "bottomLeft"):
         scan(label, primary)
     for language in preferred[1:]:
-        if relevant_pairs():
+        if pair_is_confirmed():
             break
         scan("banner", language)
         scan("topRight", language)
         scan("bottomLeft", language)
 
-    if not relevant_pairs():
+    # A larger ROI pass may be needed to detect the entry at all. Establish
+    # that real name/time relationship before the focused fallbacks consume it.
+    seeded_upscale = False
+    if not pair_is_confirmed() and not any(
+        time_hint is None or time_similarity(pair.centiseconds / 100, time_hint) for pair in pairs_now()
+    ):
+        seeded_upscale = True
+        for language in preferred[:2]:
+            for label in ("banner", "topRight"):
+                if max(crops[label].shape[:2]) < 960:
+                    scan(label, language, "upscale", upscale(crops[label], 2.0))
+            if pair_is_confirmed():
+                break
+
+    # Re-read only an observed name cell, retaining its existing same-entry
+    # time relationship and each recognizer's separate provenance.
+    for entry in pairs_now():
+        voiced = any(ch in "\u3099\u309a" for ch in unicodedata.normalize("NFD", entry.name))
+        korean = all("\uac00" <= ch <= "\ud7a3" for ch in entry.name)
+        ambiguous_korean = (
+            korean and len(entry.name) <= 2 and any(((ord(ch) - 0xAC00) // 28) % 21 == 0 for ch in entry.name)
+        )
+        if len(entry.rows) != 2 or (pair_is_confirmed() and not voiced and not ambiguous_korean):
+            continue
+        if time_hint is not None and not time_similarity(entry.centiseconds / 100, time_hint):
+            continue
+        if not korean and not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", entry.name):
+            continue
+        box = entry.rows[0].bounds
+        if not box or perf_counter() - started >= OCR_TIMEOUT_S:
+            continue
+        if korean:
+            # Preserve native screenshot pixels in the observed name cell.
+            # Whole-HUD scaling can erase the extra Hangul vowel stroke.
+            left, top = max(0, int(np.floor(box[0]))), max(0, int(np.floor(box[1])))
+            right, bottom = min(width, int(np.ceil(box[2]))), min(height, int(np.ceil(box[3])))
+            crop = img[top:bottom, left:right]
+            remaining = max(0.1, min(2.0, (OCR_TIMEOUT_S - (perf_counter() - started)) / 2))
+            time_box = entry.rows[1].bounds
+            model_dir = PADDLE_WHL_DIR / "rec" / "tesseract"
+            word = (
+                fallback_ocr.recognize_paired_korean_word(img, box, time_box, model_dir, timeout=remaining)
+                if time_box and entry.source == "topRight.top5"
+                else None
+            )
+            word_origin = (0, 0)
+            if word is None:
+                word = fallback_ocr.recognize_korean_word(crop, model_dir, timeout=remaining)
+                word_origin = (left, top)
+            result = (word.text, word.confidence) if word else None
+            model = "tesseract-best-kor"
+        else:
+            padding = max(6, int((box[3] - box[1]) * 0.2))
+            left, top = max(0, int(box[0]) - padding), max(0, int(box[1]) - padding)
+            right, bottom = min(width, int(box[2]) + padding), min(height, int(box[3]) + padding)
+            crop = img[top:bottom, left:right]
+            try:
+                result = recognize_precise_name(crop)
+            except Exception:
+                logger.warning("[ocr] focused name recognizer unavailable")
+                result = None
+            model = "PP-OCRv5_server_rec"
+        passes += 1
+        if result is None:
+            continue
+        value, confidence = result
+        if not aliases and not korean:
+
+            def unvoiced(name: str) -> str:
+                return "".join(c for c in unicodedata.normalize("NFD", name) if c not in "\u3099\u309a")
+
+            if unvoiced(value) != unvoiced(entry.name):
+                continue
+        parent = entry.rows[0].detections[0]
+        if korean and word is not None:
+            detections = []
+            for piece in word.pieces:
+                x1, y1, x2, y2 = piece.bounds
+                original = tuple(
+                    (word_origin[0] + x, word_origin[1] + y) for x, y in ((x1, y1), (x2, y1), (x2, y2), (x1, y2))
+                )
+                local = tuple(
+                    ((x - word.origin[0]) * word.scale, (y - word.origin[1]) * word.scale)
+                    for x, y in ((x1, y1), (x2, y1), (x2, y2), (x1, y2))
+                )
+                if piece.local_bounds is not None:
+                    lx1, ly1, lx2, ly2 = piece.local_bounds
+                    local = ((lx1, ly1), (lx2, ly1), (lx2, ly2), (lx1, ly2))
+                detections.append(
+                    replace(
+                        parent,
+                        text=piece.text,
+                        confidence=piece.confidence,
+                        polygon=original,
+                        local_polygon=local,
+                        model=model,
+                        variant="preciseName",
+                        pass_id=parent.pass_id + ":preciseName",
+                    )
+                )
+        else:
+            detections = [
+                replace(
+                    parent,
+                    text=value,
+                    confidence=confidence,
+                    polygon=((left, top), (right, top), (right, bottom), (left, bottom)),
+                    local_polygon=((0, 0), (right - left, 0), (right - left, bottom - top), (0, bottom - top)),
+                    language="japan" if re.search(r"[\u3040-\u30ff]", value) else "ch",
+                    model=model,
+                    variant="preciseName",
+                    pass_id=parent.pass_id + ":preciseName",
+                )
+            ]
+        observations.extend(detections)
+        name_row = evidence.Row(tuple(detections))
+        pair = evidence.Pair(
+            value,
+            entry.centiseconds,
+            entry.source,
+            min(confidence, entry.rows[1].confidence),
+            (name_row, entry.rows[1]),
+        )
+        precise_entries.append((entry, pair))
+        if pair_is_confirmed():
+            break
+
+    if not pair_is_confirmed():
+        targets = [
+            p
+            for p in pairs_now()
+            if p.source == "topRight.top5" and (time_hint is None or time_similarity(p.centiseconds / 100, time_hint))
+        ]
+        seen_bounds = set()
+        for entry in sorted(targets, key=lambda p: p.confidence, reverse=True):
+            boxes = [row.bounds for row in entry.rows if row.bounds]
+            if not boxes:
+                continue
+            left = max(0, int(min(b[0] for b in boxes)) - 8)
+            top = max(0, int(min(b[1] for b in boxes)) - 5)
+            right = min(width, int(max(b[2] for b in boxes)) + 8)
+            bottom = min(height, int(max(b[3] for b in boxes)) + 5)
+            bounds = (left, top, right, bottom)
+            if bounds in seen_bounds:
+                continue
+            seen_bounds.add(bounds)
+            target = img[top:bottom, left:right]
+            geometry = ((float(left), float(top)), target.shape)
+            language = preferred[0]
+            scan("topRight", language, "entryCrop", upscale(target, 4.0), geometry)
+            if not pair_is_confirmed():
+                gray = enhance_contrast_grayscale(target, blur=False)
+                scan("topRight", language, "entryGray", upscale(gray, 4.0), geometry)
+            if pair_is_confirmed() or len(seen_bounds) >= 2:
+                break
+
+    if not pair_is_confirmed() and "korean" in preferred:
+        # Some recognizers need the neighbouring leaderboard context to retain
+        # a thin Hangul vowel stroke. Select at most two existing HUD strips
+        # containing an already observed target entry, rather than trying every
+        # language and preprocessing combination over the entire screenshot.
+        targets = [
+            pair
+            for pair in pairs_now()
+            if pair.source == "topRight.top5"
+            and any("\uac00" <= char <= "\ud7a3" for char in pair.name)
+            and (time_hint is None or time_similarity(pair.centiseconds / 100, time_hint))
+        ]
+        context_regions = []
+        tr_height, tr_width = crops["topRight"].shape[:2]
+        ox, oy = offsets["topRight"]
+        for frac in (ROI_TR_TOP5_STRIP_0, ROI_TR_TOP5_STRIP_1, ROI_TR_TOP5_STRIP_2):
+            left, top = ox + int(frac[0] * tr_width), oy + int(frac[1] * tr_height)
+            right, bottom = ox + int(frac[2] * tr_width), oy + int(frac[3] * tr_height)
+            distances = []
+            for entry in targets:
+                boxes = [row.bounds for row in entry.rows]
+                if all(
+                    box and left <= box[0] and top <= box[1] and right >= box[2] and bottom >= box[3] for box in boxes
+                ):
+                    centres = [(box[1] + box[3]) / 2 for box in boxes if box]
+                    distances.append(abs((top + bottom) / 2 - sum(centres) / len(centres)))
+            if distances:
+                context_regions.append((min(distances), frac, (left, top)))
+        for _, frac, origin in sorted(context_regions)[:2]:
+            target = crop_within(crops["topRight"], frac)
+            scale = 2.8 if min(target.shape[:2]) < 160 else 2.0
+            processed = unsharp(upscale(target, scale), amount=1.7, sigma=1.0)
+            scan("topRight", "korean", "nameContext", processed, (origin, target.shape))
+            if pair_is_confirmed():
+                break
+
+    if not pair_is_confirmed() and not seeded_upscale:
         # One enlarged fallback per relevant ROI/language, rather than a Cartesian
         # product of every language, mask and strip. Respect the request deadline.
         for language in preferred[:2]:
             for label in ("banner", "topRight"):
-                scan(label, language, "upscale", upscale(crops[label], 2.0))
-            if relevant_pairs():
+                if max(crops[label].shape[:2]) < 960:
+                    scan(label, language, "upscale", upscale(crops[label], 2.0))
+            if pair_is_confirmed():
                 break
 
     all_pairs = pairs_now()
@@ -2737,7 +3142,14 @@ def run_ocr_pipeline(
     observed_name = selected.name if selected else None
     name_source = selected.source if selected else None
     if observed_name is None:
-        name_options = [(p.name, p.source) for p in relevant] + [(n, "bottomLeft") for n, _ in bl_names]
+        name_options = [(p.name, p.source) for p in relevant]
+        target_has_owner = time_hint is not None and any(
+            time_similarity(pair.centiseconds / 100, time_hint) for pair in all_pairs
+        )
+        # A local HUD name cannot override the independently named owner of the
+        # submitted result, particularly when the screenshot is spectated.
+        if not target_has_owner:
+            name_options.extend((name, "bottomLeft") for name, _ in bl_names)
         for observed, origin in name_options:
             if not aliases or any(names_match_strict(observed, alias) for alias in aliases):
                 observed_name, name_source = observed, origin
@@ -2750,7 +3162,8 @@ def run_ocr_pipeline(
         seconds = None
 
     codes = list(dict.fromkeys(value for value, _ in candidates))
-    result_code = code_hint if code and code_hint in codes else (codes[0] if not code and len(codes) == 1 else None)
+    observed_code = verified_code()
+    result_code = observed_code if not code or observed_code == code_hint else None
     sources: dict[str, object] = {
         "name": "hint" if matched_alias else name_source,
         "code": "hint"
@@ -2774,6 +3187,13 @@ def run_ocr_pipeline(
         reasons.append("name_mismatch" if bl_names or all_pairs else "name_not_detected")
     if not result_code:
         reasons.append("code_mismatch" if codes else "code_not_detected")
+        ambiguity_pool = [
+            (value, row) for value, row in candidates if row.detections[0].variant.startswith("codeToken")
+        ]
+        if not ambiguity_pool:
+            ambiguity_pool = [(value, row) for value, row in candidates if row.detections[0].variant != "raw"]
+        if any("O" in value and row.confidence >= 0.85 for value, row in ambiguity_pool):
+            reasons.append("code_glyph_ambiguous")
     if seconds is None:
         reasons.append(
             "time_mismatch"
@@ -2825,6 +3245,7 @@ def run_ocr_pipeline(
                 "roi": p.rows[0].detections[0].roi,
                 "language": p.rows[0].detections[0].language,
                 "variant": p.rows[0].detections[0].variant,
+                "model": p.rows[0].detections[0].model,
                 "bounds": [r.bounds for r in p.rows],
             }
             for p in all_pairs
@@ -3124,7 +3545,7 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request):
                 raise HTTPException(status_code=400, detail=f"failed to fetch image: HTTP {resp.status}")
             image_bytes = await resp.read()
         elapsed = perf_counter() - t0
-        logger.info(f"[fetch] {image_url} bytes={len(image_bytes)} t={elapsed:.2f}s")
+        logger.info("[fetch] bytes=%d t=%.2fs", len(image_bytes), elapsed)
         img = decode_image_bytes(image_bytes)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=408, detail="timeout fetching image")
@@ -3144,7 +3565,7 @@ async def extract_ocr_data(payload: ImageURLPayload, request: Request):
         )
         from fastapi.responses import JSONResponse
 
-        return JSONResponse(content=res)
+        return JSONResponse(content=res, media_type="application/json; charset=utf-8")
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="ocr timeout (queue + run)")
 
