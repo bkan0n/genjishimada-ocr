@@ -1,220 +1,115 @@
-# GenjiPK OCR (FastAPI + PaddleOCR)
+# GenjiPK OCR
 
-FastAPI microservice that extracts **player name**, **run time (seconds)**, and **map code** from Overwatch parkour screenshots using PaddleOCR 3.x (PP-OCRv5 mobile models) with CPU-safe defaults.
-Responses use **camelCase** via Pydantic aliases; internal code stays **snake_case**.
-
-## Features
-
-* 🔤 Multi-language OCR (en, ch, korean, japan) with prewarmed models
-* 🧠 Script-aware name selection (Hangul/Kana/Han/Latin weighting)
-* ⏱️ Robust time parsing with OCR noise normalization
-* 🗺️ Multi-heuristic map code extraction (strict → loose fallback)
-* 🧪 Deterministic CPU runtime (MKL/oneDNN off; thread caps)
-* 🐍 Clean Pydantic models with camelCase JSON output
-
----
+FastAPI service for player names, completion/leaderboard times, and Workshop map codes in Overwatch parkour screenshots. Uses PaddleOCR 3.3.3 and explicitly selected PP-OCRv5 mobile models on CPU.
 
 ## API
 
-### `GET /ping`
+`GET /ping` reports health and warmed language models. `POST /extract` downloads an image URL and queues OCR. The request uses **snake_case** `image_url`; it does not accept a base64 upload.
 
-Health + warmed models.
-
-**Response**
-
-```json
-{
-  "ok": true,
-  "models": ["en", "ch", "korean", "japan"]
-}
+```bash
+curl -X POST http://localhost:8000/extract \
+  -H 'Content-Type: application/json' \
+  -d '{"image_url":"https://cdn.genji.pk/screenshots/example.png","code":"WZJ79","time":1092.35,"names":["Snowmän"]}'
 ```
 
-### `POST /extract`
-
-Accepts a base64 image, returns extracted fields + raw region texts.
-
-**Request**
-
-```json
-{
-  "image_b64": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."
-}
-```
-
-**Response**
+`code`, `time`, and `names` are optional. Names are allowed aliases, not proof of identity. Omitting `time` (or passing `0` for compatibility) requests extraction without a submitted-time constraint.
 
 ```json
 {
   "extracted": {
-    "name": "DAHMX",
-    "time": 123.45,
-    "code": "A1B2C3",
+    "name": "Snowmän",
+    "time": 1092.35,
+    "code": "WZJ79",
+    "sources": {
+      "name": "hint",
+      "nameVerifiedBy": "banner",
+      "code": "hint",
+      "codeVerifiedBy": "topLeft",
+      "time": "hint",
+      "timeVerifiedBy": "banner"
+    },
     "texts": {
-      "topLeft": "MAP CODE: A1B2C3",
-      "topLeftWhite": "MAP CODE",
-      "topLeftCyan": "A1B2C3",
-      "banner": "MISSION COMPLETE TIME 123.45 SEC",
-      "topRight": "123.45 SEC",
-      "bottomLeft": "250 DAHMX"
+      "topLeft": {"en":"MAP CODE: WZJ79\nTIME 1092.35 SEC","whiteMaskEn":"","cyanMaskEn":""},
+      "banner": {"en":"SNOWMÄN MISSION COMPLETE! TIME 1092.35 SEC","text":"SNOWMÄN MISSION COMPLETE! TIME 1092.35 SEC"},
+      "topRight": {"en":"SNOWMÄN\n1092.35 SEC","top5":"SNOWMÄN\n1092.35 SEC"},
+      "bottomLeft": {"en":"SNOWMÄN"}
+    },
+    "diagnostics": {
+      "reasons": [],
+      "observedName": "SNOWMÄN",
+      "codeCandidates": ["WZJ79"],
+      "codeEvidence": [],
+      "timeCandidates": [],
+      "ocrPasses": 8
     }
   }
 }
 ```
 
-> JSON is camelCase thanks to `alias_generator=to_camel` and `populate_by_name=True`.
+The example abbreviates candidate diagnostics. Actual candidates include confidence, ROI, language, preprocessing variant, and screenshot-relative bounds. `texts` retains existing nested ROI keys and adds per-pass strings; newlines separate reconstructed rows. Text blobs are diagnostic only. The displayed OCR name is preserved in `diagnostics.observedName`; `name` returns an allowed alias only when recognition supports it. Schemas are available at `/docs` and `/redoc`.
 
-Open interactive docs at **`/docs`** and **`/redoc`**.
+Unconfirmed fields are `null`. Reason codes include `name_not_detected`, `name_mismatch`, `code_not_detected`, `code_mismatch`, `time_mismatch`, `name_time_pair_unconfirmed`, and `completion_not_confirmed`. A confirmed code alone does not verify the record.
 
----
+## Verification rules
 
-## Quickstart
+- A name/time pair must come from one localized completion banner or one spatially reconstructed leaderboard entry. Workshop layouts with a time directly below its player name are supported. Fragments from different OCR passes never form a name/time pair.
+- Without submitted aliases, a named completion banner or matching HUD identity can identify the player. A unique named row below an observed TOP 5 header can also support the submitted time. This reports the screenshot's row owner; it does not prove account ownership. Multiple players at the same time remain ambiguous.
+- Live top-left timers, checkpoint splits, and a name appearing elsewhere do not prove completion. A matching completion banner takes priority over older leaderboard entries. Conflicting readings for the same identity/source remain unconfirmed.
+- Time comparison uses exact integer centiseconds and an absolute tolerance, default `0`. Range validation defaults to 10–15360 seconds. A mismatching submitted time returns `null`; hints never supply missing OCR evidence.
+- Workshop codes are literal 4–6 alphanumeric characters, including all-letter codes. Verification resolves targeted field readings before consulting the submitted code. A truncated prefix cannot override an independently read complete field; conflicting token readings remain unconfirmed. Localized label geometry can establish the field's location for another pass.
+- `O/0`, `I/1`, and different final characters are distinct. The tested HUD font produces confident `O` readings for real zeros across multiple models. An isolated code-token reading containing `O` therefore keeps the code unconfirmed (`code_glyph_ambiguous`), including genuine letter-O codes; it is never converted to zero. Without token readings, the same guard applies to focused field readings. Codes whose isolated readings consistently show `0` can still be confirmed despite a whole-line misreading. This conservative limitation needs better glyph evidence before it can be relaxed.
+- Name comparison normalizes Unicode compatibility forms, case, spacing, and Latin diacritics separately from display. Japanese voicing marks and identity punctuation remain significant; unsupported symbols are rejected rather than erased. Rank removal requires an explicit leaderboard role and separator. A single familiar Latin digit/letter confusion in a name of at least five characters may match. Strict Hangul comparison preserves different syllables.
+- Hangul submissions first use the existing precise name-cell reads. If identity is still uncertain, a native and contrast-enhanced crop re-reads the actual completion/leaderboard entry. A successful literal reading takes precedence. Otherwise, the enabled tolerant fallback permits **one** known initial-consonant or medial-vowel substitution, including `ㅏ/ㅑ` (`송자/송쟈`). Final consonants, arbitrary edits and multiple substitutions are excluded. A conclusive independent word reading blocks the tolerant fallback.
+- Tolerant matching requires a supplied alias, a literally verified map code, an exact submitted time, at least 0.85 observed confidence, one physical entry and one best alias. Contradictory times, unrelated reread identities and ambiguous alias ties stay unconfirmed. The response marks `sources.nameMatchMode="hangul_tolerant_fallback"`; `diagnostics.nameTolerance` preserves the observed name, matched alias, changes and observed confidence. This policy can accept distinct players with visually similar names; it is an explicit tolerance decision rather than exact recognition.
+- Set `OCR_HANGUL_TOLERANT_FALLBACK=0` for strict verification. In that mode, ambiguous short Hangul `ㅏ/ㅑ` readings require an independent name-cell read, and unresolved cases return `name_glyph_ambiguous`.
 
-### Option A: Docker (recommended)
+## Running
 
-```bash
-# 1) Build (multi-stage pulls PP-OCRv5 mobile weights)
-docker build -t genjishimada-ocr:latest .
-
-# 2) Run
-docker run --rm -p 8000:8000 genjishimada-ocr:latest
-
-# 3) Test
-curl http://localhost:8000/ping
-```
-
-### Option B: Local Python
-
-> Python 3.11; Linux is recommended for PaddlePaddle CPU wheels.
+Python 3.11+ is required. Linux is recommended for deployment.
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
-If you see CPU ISA or MKL errors, see **Troubleshooting** below.
-
----
-
-## Example Requests
-
-**cURL**
+On Windows, activate with `.venv\Scripts\Activate.ps1`. Alternatively:
 
 ```bash
-# Base64-encode an image and POST
-IMG_B64=$(base64 -w0 sample.png)
-curl -sX POST http://localhost:8000/extract \
-  -H "Content-Type: application/json" \
-  -d "{\"image_b64\":\"data:image/png;base64,${IMG_B64}\"}" | jq .
+docker build -t genjishimada-ocr .
+docker run --rm -p 8000:8000 genjishimada-ocr
 ```
 
-**Python**
+The process warms English, Korean, Japanese, and Chinese mobile models at startup. A high-capacity CJK recognizer is loaded lazily for small, ambiguous Japanese/Chinese name cells. A bounded Tesseract Korean fallback reads the same actual name cell with an independent model when needed; it never receives a supplied alias. Docker includes Tesseract and a checksum-pinned official Korean model. Local Python installations need `tesseract` on PATH and `kor.traineddata` under `~/.paddleocr/whl/rec/tesseract` to enable that word reader. Without it, the configured policy either uses the targeted Paddle reread followed by tolerant matching, or abstains in strict mode.
 
-```python
-import base64, requests
-b64 = "data:image/png;base64," + base64.b64encode(open("sample.png","rb").read()).decode()
-r = requests.post("http://localhost:8000/extract", json={"image_b64": b64})
-print(r.json())
-```
+Existing Docker model directories under `~/.paddleocr/whl` are supported; absent Paddle directories trigger its normal model download. `PADDLE_PDX_CACHE_HOME` can relocate downloaded Paddle models. OCR calls, including targeted fallbacks, stay serialized through one FIFO worker per process. A timed-out request retains the inference slot until native OCR finishes. More workers duplicate model memory and inference capacity; start with one.
 
----
+## Configuration
 
-## How It Works
+| Variable | Default | Behavior |
+|---|---|---|
+| `OCR_MKLDNN` | `1` | oneDNN enabled; recognized PIR errors retry once with a cached engine with oneDNN disabled |
+| `OCR_CPU_THREADS` | auto, at most 4 | CPU threads per engine |
+| `OCR_TIMEOUT_S` | `60` | Inference response deadline; no new fallback starts after this request budget |
+| `OCR_QUEUE_MAXSIZE` | `32` | Queued jobs; `0` means unlimited |
+| `OCR_QUEUE_WAIT_S` | `180` | Queue wait allowance |
+| `OCR_DEBUG_TEXTS` | `0` | Include detailed polygons/provenance in response diagnostics |
+| `OCR_HANGUL_TOLERANT_FALLBACK` | `1` | After inconclusive targeted rereading, allow one known Hangul visual change with exact code/time evidence; `0` retains strict mode |
+| `HINT_TIME_ABS_TOL` | `0` | Absolute time tolerance in seconds, never a percentage |
+| `HINT_MATCH_THRESHOLD` | `0.90` | Name comparison threshold; map codes always require literal equality |
+| `MIN_VALID_TIME_SECONDS` | `10.0` | Lower bound for time extraction |
 
-1. **Decoding & ROI**
-   The service decodes the base64 image and crops regions of interest (top-left, banner, top-right, bottom-left).
+`FAST_OCR`, `ACCURATE_OCR`, `OCR_EARLY_EXIT`, and `OCR_TRUST_HINTS` remain import-compatible with legacy helpers. The evidence pipeline uses bounded, targeted fallbacks; these legacy settings cannot enable live-timer verification or trust unsupported hints. Set `OCR_MKLDNN=0` if necessary for CPU/oneDNN compatibility. OpenCV threading is disabled; BLAS/OMP defaults are set before Paddle is imported.
 
-2. **Preprocessing**
+## Validation
 
-   * Contrast enhancement (CLAHE)
-   * White/cyan masks for high-salience overlays
-   * Adaptive thresholding variant for the banner
+Validation results and remaining recognition limitations are recorded in the pull request. Test fixtures, test code and investigation reports are retained locally and are not distributed with the service.
 
-3. **OCR (PP-OCRv5 mobile)**
-   Engines are prewarmed per language and reused. `cls` is disabled for speed.
+## Layout
 
-4. **Parsing**
+- `main.py`: API, queue, preprocessing, inference adapters, orchestration, and compatible text helpers.
+- `evidence.py`: model-independent Unicode/code/time parsing, structured detections, spatial grouping, and relationship validation.
+- `fallback_ocr.py`: optional, bounded Korean name-cell recognition without name hints.
 
-   * **Time:** lexes near “TIME/SEC”, corrects OCR look-alike digits, scores proximity.
-   * **Name:** ASCII bottom-left heuristics first; otherwise script-aware CJK candidate selection with ROI weights.
-   * **Map Code:** strict “MAP CODE: XXXX” → short window after “MAP” → global 4–6 token scan with validation.
-
-5. **Response Models**
-   Pydantic models output **camelCase**; internal attributes remain snake_case.
-
----
-
-## Configuration & Performance
-
-* **CPU flags** (already set):
-  `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `FLAGS_use_mkldnn=0`
-* **Model cache path:** `/root/.paddleocr/whl` (prepopulated in Docker stage).
-* **Workers:** `--workers 4` is a good default; tune for your CPU.
-* **Memory:** PP-OCRv5 mobile is modest on CPU; each worker loads its own models.
-
----
-
-## Project Layout
-
-```
-.
-├─ main.py                 # FastAPI app, OCR logic, parsing heuristics
-├─ Dockerfile              # Multi-stage build with pre-fetched PP-OCRv5 mobile models
-├─ requirements.txt        # Runtime deps (pinned)
-├─ pyproject.toml          # Packaging + Ruff config
-├─ pyrightconfig.json      # Type checking (basic)
-└─ README.md
-```
-
----
-
-## Development
-
-### Lint & Type Check
-
-```bash
-# Ruff (configured in pyproject)
-ruff check .
-
-# Pyright (basic mode)
-pyright
-```
-
----
-
-## Troubleshooting
-
-* **`paddlepaddle` wheel/CPU ISA issues (AVX/AVX2):**
-
-  * Prefer the Docker image (pre-tested).
-  * On bare metal, ensure your CPU supports the wheel you install; otherwise fall back to compatible wheels or use Docker.
-
-* **OpenCV GUI errors:**
-  Using `opencv-python-headless` avoids GUI deps. If you install full OpenCV, add `libgl1`/`libglib2.0-0`.
-
-* **MKL/oneDNN perf variance:**
-  If you want absolute determinism, keep `FLAGS_use_mkldnn=0`. If you want extra speed and your CPU supports it, leave the Docker defaults (AVX2 hints) and benchmark.
-
-* **`503 OCR models not ready yet`:**
-  Ensure the app started completely (the lifespan manager warms models at startup). Check `/ping`.
-
----
-
-## Extending
-
-* Add new ROIs or languages: update the `SUPPORTED_LANGUAGES`, `_model_dirs_for_language_code`, and Docker model fetch stage.
-* Add more HUD heuristics: create dedicated `extract_*` helpers and unit tests per heuristic.
-
----
-
-## License
-
-MIT
-
----
-
-## Acknowledgements
-
-* [PaddleOCR / PP-OCRv5](https://github.com/PaddlePaddle/PaddleOCR)
-* FastAPI / Pydantic / OpenCV / NumPy / Pillow
-
+MIT. Built with [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), [Tesseract](https://github.com/tesseract-ocr/tesseract), FastAPI, OpenCV, NumPy, and Pillow.
