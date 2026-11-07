@@ -2605,6 +2605,16 @@ def recognize_precise_name(image: np.ndarray) -> tuple[str, float] | None:
     return (name, detections[0].confidence) if name else None
 
 
+def _needs_precise_hangul_name(name: str) -> bool:
+    """Identify short Hangul readings whose thin medial stroke is ambiguous in this HUD font."""
+    value = evidence.normalize_name(name)
+    return (
+        1 <= len(value) <= 2
+        and all("\uac00" <= char <= "\ud7a3" for char in value)
+        and any(((ord(char) - 0xAC00) // 28) % 21 == 0 for char in value)
+    )
+
+
 def run_ocr_pipeline(
     img: np.ndarray,
     *,
@@ -2682,13 +2692,18 @@ def run_ocr_pipeline(
         return [(name, row) for row in rows if (name := evidence.clean_name(row.text))]
 
     def relevant_pairs() -> list[evidence.Pair]:
+        supported_pairs = [
+            pair
+            for pair in pairs_now()
+            if not _needs_precise_hangul_name(pair.name) or pair.rows[0].detections[0].model == "tesseract-best-kor"
+        ]
         if aliases:
-            return [p for p in pairs_now() if any(names_match_strict(p.name, a) for a in aliases)]
+            return [p for p in supported_pairs if any(names_match_strict(p.name, a) for a in aliases)]
         bl = bottom_left_names()
         # With no submitted identity, a unique named leaderboard entry at the
         # submitted time is direct result evidence. Its own row supplies BOTH
         # fields; unrelated names and live timers never contribute to this.
-        all_pairs = pairs_now()
+        all_pairs = supported_pairs
         headers = [
             d.bounds
             for d in observations
@@ -2749,10 +2764,8 @@ def run_ocr_pipeline(
         # cannot establish that glyph's identity. Abstain, without rewriting it
         # or consulting the hint. Unambiguous zero readings remain literal.
         tokens = [(value, row) for value, row in focused if row.detections[0].variant.startswith("codeToken")]
-        if not tokens and not label_rows:
-            return None
         pool = tokens or focused
-        if any("O" in value and row.confidence >= 0.85 for value, row in pool):
+        if (not tokens and not label_rows) or any("O" in value and row.confidence >= 0.85 for value, row in pool):
             return None
         values = {value for value, _ in pool}
         # An independently read longer field supersedes its truncated prefix.
@@ -2939,9 +2952,7 @@ def run_ocr_pipeline(
     for entry in pairs_now():
         voiced = any(ch in "\u3099\u309a" for ch in unicodedata.normalize("NFD", entry.name))
         korean = all("\uac00" <= ch <= "\ud7a3" for ch in entry.name)
-        ambiguous_korean = (
-            korean and len(entry.name) <= 2 and any(((ord(ch) - 0xAC00) // 28) % 21 == 0 for ch in entry.name)
-        )
+        ambiguous_korean = _needs_precise_hangul_name(entry.name)
         if len(entry.rows) != 2 or (pair_is_confirmed() and not voiced and not ambiguous_korean):
             continue
         if time_hint is not None and not time_similarity(entry.centiseconds / 100, time_hint):
@@ -3149,7 +3160,7 @@ def run_ocr_pipeline(
         # A local HUD name cannot override the independently named owner of the
         # submitted result, particularly when the screenshot is spectated.
         if not target_has_owner:
-            name_options.extend((name, "bottomLeft") for name, _ in bl_names)
+            name_options.extend((name, "bottomLeft") for name, _ in bl_names if not _needs_precise_hangul_name(name))
         for observed, origin in name_options:
             if not aliases or any(names_match_strict(observed, alias) for alias in aliases):
                 observed_name, name_source = observed, origin
@@ -3185,6 +3196,12 @@ def run_ocr_pipeline(
     reasons = []
     if not result_name:
         reasons.append("name_mismatch" if bl_names or all_pairs else "name_not_detected")
+        if any(
+            _needs_precise_hangul_name(pair.name)
+            and (time_hint is None or time_similarity(pair.centiseconds / 100, time_hint))
+            for pair in all_pairs
+        ):
+            reasons.append("name_glyph_ambiguous")
     if not result_code:
         reasons.append("code_mismatch" if codes else "code_not_detected")
         ambiguity_pool = [

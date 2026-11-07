@@ -194,11 +194,11 @@ def name_score(left: str | None, right: str | None) -> float:
     return 0.95 if len(changes) == 1 and frozenset(changes[0]) in confusions else 0.0
 
 
-def clean_name(value: str) -> str | None:
+def clean_name(value: str, *, allow_rank: bool = False) -> str | None:
     """Keep the observed Unicode spelling while rejecting HUD prose and bare numbers."""
-    value = value.strip(" \t\n:\uff1a!\uff01|,.*~-")
-    value = re.sub(r"^\s*[1-5][.)、:]\s*", "", value)
-    value = re.sub(r"^\s*TOP\s*5\s*", "", value, flags=re.IGNORECASE)
+    value = value.strip()
+    if allow_rank:
+        value = re.sub(r"^[1-5][.)、:]\s+", "", value)
     words = value.split()
     if not words or any(w.casefold() in NOISE for w in words) or HUD_NOISE.search(value):
         return None
@@ -271,7 +271,7 @@ def text_pairs(text: str, source: str = "topRight.top5", minimum: float = 10.0) 
             continue
         start = 0
         for match, cs in time_values(line, minimum):
-            prefix = line[start : match.start()].strip(" :\uff1a|-\t")
+            prefix = line[start : match.start()].strip()
             # A separate digit before a decimal can belong to the time rather
             # than the identity: ``Alice 1 107.23`` must not verify Alice1's
             # 107.23 result. Text alone cannot resolve that boundary.
@@ -283,7 +283,7 @@ def text_pairs(text: str, source: str = "topRight.top5", minimum: float = 10.0) 
                 if combined is not None and minimum * 100 <= combined <= 1536000:
                     start = match.end()
                     continue
-            name = clean_name(prefix)
+            name = clean_name(prefix, allow_rank=source == "topRight.top5")
             if name:
                 pairs.append((name, cs))
             start = match.end()
@@ -669,7 +669,7 @@ def paired_evidence(detections: list[Detection], source: str, minimum: float = 1
         return pairs
     # Workshop leaderboards often put each player's time directly below their name.
     for i, row in enumerate(rows[:-1]):
-        name = clean_name(row.text)
+        name = clean_name(row.text, allow_rank=True)
         following = rows[i + 1]
         a, b = row.bounds, following.bounds
         first, second = row.detections[0], following.detections[0]
