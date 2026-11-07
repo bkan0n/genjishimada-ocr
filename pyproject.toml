@@ -15,11 +15,8 @@ dependencies = [
     "aiohttp==3.13.3",
 ]
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-markers = ["integration: opt-in PaddleOCR/CDN image regressions"]
-
-[dependency-groups]
-dev = ["pytest>=8", "ruff>=0.14", "pyright>=1.1"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 exclude = ["tests"]

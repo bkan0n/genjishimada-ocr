@@ -95,42 +95,13 @@ The process warms English, Korean, Japanese, and Chinese models at startup. Exis
 
 `FAST_OCR`, `ACCURATE_OCR`, `OCR_EARLY_EXIT`, and `OCR_TRUST_HINTS` remain import-compatible with legacy helpers. The evidence pipeline uses bounded, targeted fallbacks; these legacy settings cannot enable live-timer verification or trust unsupported hints. Set `OCR_MKLDNN=0` if necessary for CPU/oneDNN compatibility. OpenCV threading is disabled; BLAS/OMP defaults are set before Paddle is imported.
 
-## Tests and investigation
+## Validation
 
-```bash
-pip install pytest ruff pyright
-ruff check .
-pyright
-pytest -q
-git diff --check
-```
-
-Unit tests load no Paddle models and require no network. They cover Unicode names, localized banners, geometry/transforms, split fields, code disagreements, strict time mismatches, live-timer rejection, aliases, response compatibility, and serialization after timeout.
-
-Image tests are **opt-in** and run the actual pipeline. They download only the nine supplied screenshots into temporary storage, or an explicitly chosen ignored cache. Models may download on first use. Classifications and manually transcribed aliases are in `tests/corpus.json`; recognition targets allow `null` and are not asserted as guaranteed positives. Positive cases assert complete fields; mismatch cases assert rejection.
-
-```bash
-RUN_OCR_INTEGRATION=1 OCR_FIXTURE_DIR=.ocr-cache OCR_REPORT_DIR=.ocr-cache/results \
-  pytest -q tests/test_images.py
-```
-
-PowerShell:
-
-```powershell
-$env:RUN_OCR_INTEGRATION = '1'
-$env:OCR_FIXTURE_DIR = '.ocr-cache'
-$env:OCR_REPORT_DIR = '.ocr-cache/results'
-pytest -q tests/test_images.py
-```
-
-Set `OCR_BENCHMARK_MODULE` to an importable baseline module and `OCR_CAPTURE_BASELINE=1` to capture its behavior without corrected assertions. `OCR_BENCHMARK_MODELS` optionally points at a directory containing the four named mobile models so both versions use identical weights. Per-image measurements include latency and the response. Run sequentially on otherwise idle hardware for meaningful latency comparisons.
-
-See [the investigation and corpus report](docs/ocr-evidence-validation.md) for root causes, validation results, remaining limitations, and baseline comparisons.
+Validation results and remaining recognition limitations are recorded in the pull request. Test fixtures, test code and investigation reports are retained locally and are not distributed with the service.
 
 ## Layout
 
 - `main.py`: API, queue, preprocessing, inference adapters, orchestration, and compatible text helpers.
 - `evidence.py`: model-independent Unicode/code/time parsing, structured detections, spatial grouping, and relationship validation.
-- `tests/`: deterministic tests and the opt-in image corpus.
 
 MIT. Built with [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), FastAPI, OpenCV, NumPy, and Pillow.
