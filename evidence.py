@@ -13,6 +13,9 @@ from typing import Any
 
 Point = tuple[float, float]
 Polygon = tuple[Point, ...]
+# Initial consonants and medial vowels occupy different Hangul components.
+HANGUL_INITIAL_CONFUSIONS = {0: 1, 1: 0, 3: 4, 4: 3, 7: 8, 8: 7, 9: 10, 10: 9, 12: 13, 13: 12}
+HANGUL_MEDIAL_CONFUSIONS = {0: 2, 2: 0, 1: 3, 3: 1, 4: 6, 6: 4, 5: 7, 7: 5, 8: 12, 12: 8, 13: 17, 17: 13}
 COMPLETION = re.compile(
     r"MISSION\s*COMPLETE[!\uff01]?|任务完成|任務完成|挑战完成|挑戰完成|通关成功|通關成功|"
     r"ミッション(?:を)?(?:完了|クリア)|クリア成功|미션\s*완료|임무\s*완료|"
@@ -140,6 +143,16 @@ class Pair:
     rows: tuple[Row, ...]
 
 
+def same_pair_region(left: Pair, right: Pair) -> bool:
+    """Identify the same physical name cell across passes without comparing its spelling."""
+    a, b = left.rows[0].bounds, right.rows[0].bounds
+    if not a or not b or left.source != right.source or left.centiseconds != right.centiseconds:
+        return False
+    area = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    overlap = max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    return area > 0 and overlap / area >= 0.7
+
+
 @dataclass(frozen=True)
 class MetadataCodeRegion:
     """An unverified code-field location bounded by independent semantic anchors."""
@@ -192,6 +205,72 @@ def name_score(left: str | None, right: str | None) -> float:
     confusions = {frozenset(p) for p in ("0o", "1i", "1l", "5s", "8b")}
     changes = [(x, y) for x, y in zip(a, b) if x != y]
     return 0.95 if len(changes) == 1 and frozenset(changes[0]) in confusions else 0.0
+
+
+@dataclass(frozen=True)
+class HangulNameChange:
+    """One allowed visual substitution, never an exact identity equivalence."""
+
+    index: int
+    observed: str
+    expected: str
+    component: str
+
+
+def hangul_visual_changes(observed: str, expected: str) -> tuple[HangulNameChange, ...] | None:
+    """Allow at most one known initial/vowel change, preserving every final consonant."""
+    left, right = normalize_name(observed), normalize_name(expected)
+    if not left or len(left) != len(right) or not any("\uac00" <= c <= "\ud7a3" for c in left):
+        return None
+    changes = []
+    for index, (a, b) in enumerate(zip(left, right, strict=True)):
+        if a == b:
+            continue
+        if changes or not ("\uac00" <= a <= "\ud7a3" and "\uac00" <= b <= "\ud7a3"):
+            return None
+        initial_a, tail_a = divmod(ord(a) - 0xAC00, 21 * 28)
+        initial_b, tail_b = divmod(ord(b) - 0xAC00, 21 * 28)
+        medial_a, final_a = divmod(tail_a, 28)
+        medial_b, final_b = divmod(tail_b, 28)
+        if final_a != final_b:
+            return None
+        initial_change = medial_a == medial_b and HANGUL_INITIAL_CONFUSIONS.get(initial_a) == initial_b
+        medial_change = initial_a == initial_b and HANGUL_MEDIAL_CONFUSIONS.get(medial_a) == medial_b
+        if not (initial_change or medial_change):
+            return None
+        changes.append(HangulNameChange(index, a, b, "initial" if initial_change else "medial"))
+    return tuple(changes)
+
+
+@dataclass(frozen=True)
+class HangulFallbackMatch:
+    """A policy-level near match, distinct from literal recognition."""
+
+    pair: Pair
+    alias: str
+    changes: tuple[HangulNameChange, ...]
+
+
+def select_hangul_fallback(pairs: list[Pair], aliases: list[str], target: int) -> HangulFallbackMatch | None:
+    """Require one physical result, one best alias, and an exact uncontradicted time."""
+    matches = [
+        HangulFallbackMatch(pair, alias, changes)
+        for pair in pairs
+        for alias in aliases
+        if (changes := hangul_visual_changes(pair.name, alias)) is not None
+    ]
+    banner = [match for match in matches if match.pair.source == "banner"]
+    pool = banner or matches
+    if not pool or {match.pair.centiseconds for match in pool} != {target}:
+        return None
+    confident = [match for match in pool if match.pair.confidence >= 0.85]
+    if not confident or not all(same_pair_region(confident[0].pair, match.pair) for match in confident):
+        return None
+    distance = min(len(match.changes) for match in confident)
+    closest = [match for match in confident if len(match.changes) == distance]
+    if len({normalize_name(match.alias) for match in closest}) != 1:
+        return None
+    return max(closest, key=lambda match: match.pair.confidence)
 
 
 def clean_name(value: str, *, allow_rank: bool = False) -> str | None:

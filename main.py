@@ -105,6 +105,7 @@ OCR_CPU_THREADS: int = _t if _t > 0 else max(1, min(4, AVAILABLE_CORES))
 # Perf/behavior toggles
 OCR_EARLY_EXIT = _env_bool("OCR_EARLY_EXIT", default=True)  # stop once we have everything
 OCR_DEBUG_TEXTS = _env_bool("OCR_DEBUG_TEXTS", default=False)  # expensive debug OCR strings
+OCR_HANGUL_TOLERANT_FALLBACK = _env_bool("OCR_HANGUL_TOLERANT_FALLBACK", default=True)
 ACCURATE_OCR = _env_bool("ACCURATE_OCR", default=False)  # if True, run banner/top5 even if TL time found
 OCR_TRUST_HINTS = _env_bool("OCR_TRUST_HINTS", default=False)  # legacy setting; cannot enable unsupported hints
 
@@ -385,18 +386,7 @@ _HANGUL_CHO = [
     "ㅍ",
     "ㅎ",
 ]
-_HANGUL_TENSE_MAP = {
-    0: 1,  # ㄱ -> ㄲ
-    1: 0,  # ㄲ -> ㄱ
-    3: 4,  # ㄷ -> ㄸ
-    4: 3,  # ㄸ -> ㄷ
-    7: 8,  # ㅂ -> ㅃ
-    8: 7,  # ㅃ -> ㅂ
-    9: 10,  # ㅅ -> ㅆ
-    10: 9,  # ㅆ -> ㅅ
-    12: 13,  # ㅈ -> ㅉ
-    13: 12,  # ㅉ -> ㅈ
-}
+_HANGUL_TENSE_MAP = evidence.HANGUL_INITIAL_CONFUSIONS
 
 # =============================================================================
 # PaddleOCR engine registry
@@ -2653,6 +2643,8 @@ def run_ocr_pipeline(
         if perf_counter() - started >= OCR_TIMEOUT_S:
             return
         crop = crops[label] if image is None else image
+        if crop.size == 0:
+            return
         observations.extend(
             read_roi_evidence(
                 crop,
@@ -2667,12 +2659,7 @@ def run_ocr_pipeline(
         passes += 1
 
     def same_entry(left: evidence.Pair, right: evidence.Pair) -> bool:
-        a, b = left.rows[0].bounds, right.rows[0].bounds
-        if not a or not b or left.source != right.source or left.centiseconds != right.centiseconds:
-            return False
-        area = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
-        overlap = max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
-        return area > 0 and overlap / area >= 0.7
+        return evidence.same_pair_region(left, right)
 
     def pairs_now() -> list[evidence.Pair]:
         native = [
@@ -3123,7 +3110,70 @@ def run_ocr_pipeline(
             if pair_is_confirmed():
                 break
 
-    if not pair_is_confirmed() and not seeded_upscale:
+    def retry_hangul_identity() -> tuple[evidence.HangulFallbackMatch | None, int]:
+        target = evidence.to_centiseconds(time_hint)
+        eligible = (
+            OCR_HANGUL_TOLERANT_FALLBACK
+            and aliases
+            and target is not None
+            and code_hint
+            and verified_code() == code_hint
+            and not pair_is_confirmed()
+        )
+        if not eligible or target is None:
+            return None, 0
+        headers = [
+            d.bounds
+            for d in observations
+            if d.roi == "topRight"
+            and d.confidence >= 0.65
+            and d.bounds
+            and re.search(r"\bTOP\s*5\b|\ud0d1\s*5|\uc21c\uc704\s*5|\u524d\s*5", d.text, re.IGNORECASE)
+        ]
+
+        def anchored_pairs() -> list[evidence.Pair]:
+            return [
+                pair
+                for pair in pairs_now()
+                if pair.source == "banner"
+                or (pair.rows[0].bounds and any(pair.rows[0].bounds[1] >= header[3] for header in headers))
+            ]
+
+        match = evidence.select_hangul_fallback(anchored_pairs(), aliases, target)
+        # A usable independent word reading is conclusive; a near-match hint
+        # must not replace that observed identity, even if it differs by one glyph.
+        if match is None or any(pair.centiseconds == target for _, pair in precise_entries):
+            return None, 0
+        boxes = [row.bounds for row in match.pair.rows]
+        if not all(boxes):
+            return None, 0
+        left = max(0, int(min(box[0] for box in boxes if box)) - 8)
+        top = max(0, int(min(box[1] for box in boxes if box)) - 5)
+        right = min(width, int(max(box[2] for box in boxes if box)) + 8)
+        bottom = min(height, int(max(box[3] for box in boxes if box)) + 5)
+        crop = img[top:bottom, left:right]
+        label = "banner" if match.pair.source == "banner" else "topRight"
+        geometry = ((float(left), float(top)), crop.shape)
+        before = passes
+        scan(label, "korean", "hangulRetry", crop, geometry)
+        if not pair_is_confirmed():
+            scan(label, "korean", "hangulRetryGray", upscale(enhance_contrast_grayscale(crop, blur=False), 2), geometry)
+        count = passes - before
+        if not count or pair_is_confirmed():
+            return None, count
+        reread_pairs = [
+            pair
+            for pair in pairs_now()
+            if pair.rows[0].detections[0].variant.startswith("hangulRetry") and pair.confidence >= 0.85
+        ]
+        if any(
+            all(evidence.hangul_visual_changes(pair.name, alias) is None for alias in aliases) for pair in reread_pairs
+        ):
+            return None, count
+        return evidence.select_hangul_fallback(anchored_pairs(), aliases, target), count
+
+    tolerant_match, hangul_retry_passes = retry_hangul_identity()
+    if not pair_is_confirmed() and not seeded_upscale and tolerant_match is None:
         # One enlarged fallback per relevant ROI/language, rather than a Cartesian
         # product of every language, mask and strip. Respect the request deadline.
         for language in preferred[:2]:
@@ -3133,6 +3183,8 @@ def run_ocr_pipeline(
             if pair_is_confirmed():
                 break
 
+    if tolerant_match is None and not hangul_retry_passes:
+        tolerant_match, hangul_retry_passes = retry_hangul_identity()
     all_pairs = pairs_now()
     relevant = relevant_pairs()
     banner_pairs = [p for p in relevant if p.source == "banner"]
@@ -3148,6 +3200,8 @@ def run_ocr_pipeline(
     supported = [p for p in selections if time_hint is not None and time_similarity(p.centiseconds / 100, time_hint)]
     if supported or selections:
         selected = (supported or selections)[0]
+    if tolerant_match is not None:
+        selected = tolerant_match.pair
 
     bl_names = bottom_left_names()
     observed_name = selected.name if selected else None
@@ -3165,7 +3219,11 @@ def run_ocr_pipeline(
             if not aliases or any(names_match_strict(observed, alias) for alias in aliases):
                 observed_name, name_source = observed, origin
                 break
-    matched_alias = next((a for a in aliases if names_match_strict(observed_name, a)), None)
+    matched_alias = (
+        tolerant_match.alias
+        if tolerant_match
+        else next((a for a in aliases if names_match_strict(observed_name, a)), None)
+    )
     result_name = matched_alias if aliases else observed_name
     seconds_ocr = selected.centiseconds / 100 if selected else None
     seconds = None if invalid_time_hint else prefer_provided_time(seconds_ocr, time)
@@ -3190,6 +3248,8 @@ def run_ocr_pipeline(
         sources["codeVerifiedBy"] = "topLeft"
     if matched_alias:
         sources["nameVerifiedBy"] = name_source
+    if tolerant_match:
+        sources["nameMatchMode"] = "hangul_tolerant_fallback"
     if seconds is not None and selected:
         sources["timeVerifiedBy"] = selected.source
 
@@ -3269,6 +3329,17 @@ def run_ocr_pipeline(
         ],
         "ocrPasses": passes,
     }
+    if hangul_retry_passes:
+        diagnostics["hangulRereadPasses"] = hangul_retry_passes
+    if tolerant_match:
+        diagnostics["nameTolerance"] = {
+            "observed": tolerant_match.pair.name,
+            "matchedAlias": tolerant_match.alias,
+            "changes": [dataclasses.asdict(change) for change in tolerant_match.changes],
+            "observedConfidence": tolerant_match.pair.confidence,
+            "rereadAttempted": True,
+            "reason": "targeted_reread_inconclusive",
+        }
     if OCR_DEBUG_TEXTS:
         diagnostics["evidence"] = [dataclasses.asdict(d) for d in evidence.deduplicate(observations)]
     logger.info("[ocr] evidence t=%.2fs passes=%d", perf_counter() - started, passes)
